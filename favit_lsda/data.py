@@ -73,8 +73,11 @@ def _wavelet_artifact(rgb: Tensor) -> Tensor:
 def build_cnn_input(
     rgb: Tensor, mode: str, sample_path: str | Path | None = None
 ) -> Tensor:
-    artifact_channels(mode)
     description = f"artifact mode {mode!r} for {sample_path or '<unknown path>'}"
+    try:
+        layout = _ARTIFACT_LAYOUTS[mode]
+    except KeyError as error:
+        raise ValueError(f"{description}: unknown artifact mode") from error
     if rgb.ndim != 3 or rgb.shape[0] != 3:
         raise ValueError(f"{description}: expected RGB tensor with shape [3, H, W]")
     if not rgb.is_floating_point():
@@ -82,16 +85,15 @@ def build_cnn_input(
     if not torch.isfinite(rgb).all():
         raise ValueError(f"{description}: RGB tensor must be finite")
     if torch.all(rgb == rgb[..., :1, :1]):
-        artifacts = {name: torch.zeros_like(rgb) for name in _ARTIFACT_LAYOUTS[mode]}
+        artifacts = [torch.zeros_like(rgb) for _ in layout]
     else:
-        artifacts = {
-            "srm": _srm_artifact(rgb),
-            "fft": _fft_artifact(rgb),
-            "wavelet": _wavelet_artifact(rgb),
+        builders = {
+            "srm": _srm_artifact,
+            "fft": _fft_artifact,
+            "wavelet": _wavelet_artifact,
         }
-    return torch.cat(
-        [rgb] + [_normalize_artifact(artifacts[name]) for name in _ARTIFACT_LAYOUTS[mode]]
-    )
+        artifacts = [builders[name](rgb) for name in layout]
+    return torch.cat([rgb] + [_normalize_artifact(artifact) for artifact in artifacts])
 
 
 class FaceTransform:
