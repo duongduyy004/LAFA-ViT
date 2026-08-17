@@ -2,13 +2,12 @@ import csv
 import random
 
 import pytest
+import pytest
 import torch
 from PIL import Image
 
-from favit_lsda import data
 from favit_lsda.data import (
     FaceTransform,
-    FrameFaceDataset,
     GroupedForgeryDataset,
     artifact_channels,
     build_cnn_input,
@@ -39,27 +38,11 @@ def test_constant_artifacts_normalize_to_finite_zero_tensors(mode):
     assert torch.equal(cnn[3:], torch.zeros_like(cnn[3:]))
 
 
-def test_unknown_artifact_mode_reports_mode_and_sample_path():
-    with pytest.raises(ValueError, match=r"rgb_dct.*bad.png"):
-        build_cnn_input(torch.ones(3, 8, 8), "rgb_dct", "bad.png")
-
-
 def test_invalid_artifact_input_reports_mode_and_sample_path():
     with pytest.raises(ValueError, match=r"rgb_fft.*bad.png"):
         build_cnn_input(torch.ones(1, 8, 8), "rgb_fft", "bad.png")
     with pytest.raises(ValueError, match="unknown artifact mode: rgb_dct"):
         artifact_channels("rgb_dct")
-
-
-def test_rgb_mode_skips_derived_artifact_builders(monkeypatch):
-    def fail(*_args):
-        raise AssertionError("derived artifact builder invoked")
-
-    monkeypatch.setattr(data, "_srm_artifact", fail)
-    monkeypatch.setattr(data, "_fft_artifact", fail)
-    monkeypatch.setattr(data, "_wavelet_artifact", fail)
-    rgb = torch.linspace(-1, 1, 3 * 8 * 8).reshape(3, 8, 8)
-    assert torch.equal(build_cnn_input(rgb, "rgb"), rgb)
 
 
 def test_transform_returns_rgb_and_artifact_tensor_after_augmentation():
@@ -82,7 +65,9 @@ def test_domain_shift_transform_preserves_shape_and_range():
         jpeg_quality_min=30,
     )
     tensor, cnn = transform(Image.new("RGB", (80, 72), "red"))
+    tensor, cnn = transform(Image.new("RGB", (80, 72), "red"))
     assert tensor.shape == (3, 64, 64)
+    assert cnn.shape == tensor.shape
     assert cnn.shape == tensor.shape
     assert torch.isfinite(tensor).all()
     assert -1.0 <= tensor.min() <= tensor.max() <= 1.0

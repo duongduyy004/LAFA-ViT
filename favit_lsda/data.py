@@ -8,9 +8,11 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
+from torchvision.transforms import ColorJitter
 from torchvision.transforms import ColorJitter
 from torchvision.transforms import functional as TF
 from torchvision.transforms.functional import InterpolationMode
@@ -71,11 +73,8 @@ def _wavelet_artifact(rgb: Tensor) -> Tensor:
 def build_cnn_input(
     rgb: Tensor, mode: str, sample_path: str | Path | None = None
 ) -> Tensor:
+    artifact_channels(mode)
     description = f"artifact mode {mode!r} for {sample_path or '<unknown path>'}"
-    try:
-        layout = _ARTIFACT_LAYOUTS[mode]
-    except KeyError as error:
-        raise ValueError(f"{description}: unknown artifact mode") from error
     if rgb.ndim != 3 or rgb.shape[0] != 3:
         raise ValueError(f"{description}: expected RGB tensor with shape [3, H, W]")
     if not rgb.is_floating_point():
@@ -83,15 +82,16 @@ def build_cnn_input(
     if not torch.isfinite(rgb).all():
         raise ValueError(f"{description}: RGB tensor must be finite")
     if torch.all(rgb == rgb[..., :1, :1]):
-        artifacts = [torch.zeros_like(rgb) for _ in layout]
+        artifacts = {name: torch.zeros_like(rgb) for name in _ARTIFACT_LAYOUTS[mode]}
     else:
-        builders = {
-            "srm": _srm_artifact,
-            "fft": _fft_artifact,
-            "wavelet": _wavelet_artifact,
+        artifacts = {
+            "srm": _srm_artifact(rgb),
+            "fft": _fft_artifact(rgb),
+            "wavelet": _wavelet_artifact(rgb),
         }
-        artifacts = [builders[name](rgb) for name in layout]
-    return torch.cat([rgb] + [_normalize_artifact(artifact) for artifact in artifacts])
+    return torch.cat(
+        [rgb] + [_normalize_artifact(artifacts[name]) for name in _ARTIFACT_LAYOUTS[mode]]
+    )
 
 
 class FaceTransform:
@@ -114,6 +114,7 @@ class FaceTransform:
         jpeg_probability: float = 0.0,
         jpeg_quality_min: int = 40,
         artifact_mode: str = "rgb",
+        artifact_mode: str = "rgb",
     ) -> None:
         self.image_size = image_size
         self.horizontal_flip = horizontal_flip
@@ -123,6 +124,8 @@ class FaceTransform:
         self.degradation_probability = float(degradation_probability)
         self.jpeg_probability = float(jpeg_probability)
         self.jpeg_quality_min = int(jpeg_quality_min)
+        artifact_channels(artifact_mode)
+        self.artifact_mode = artifact_mode
         artifact_channels(artifact_mode)
         self.artifact_mode = artifact_mode
         probabilities = (
@@ -219,6 +222,11 @@ class FaceTransform:
         if image.mode != "RGB":
             raise ValueError(f"expected RGB image: {sample_path or '<unknown path>'}")
         image = self._resize_crop(image, crop or self.sample_crop())
+        sample_path: str | Path | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if image.mode != "RGB":
+            raise ValueError(f"expected RGB image: {sample_path or '<unknown path>'}")
+        image = self._resize_crop(image, crop or self.sample_crop())
         if flip:
             image = TF.hflip(image)
         if self.color_jitter is not None:
@@ -226,6 +234,8 @@ class FaceTransform:
         if random.random() < self.grayscale_probability:
             image = TF.rgb_to_grayscale(image, num_output_channels=3)
         image = self._apply_degradation(image)
+        rgb = TF.normalize(TF.to_tensor(image), [0.5] * 3, [0.5] * 3)
+        return rgb, build_cnn_input(rgb, self.artifact_mode, sample_path)
         rgb = TF.normalize(TF.to_tensor(image), [0.5] * 3, [0.5] * 3)
         return rgb, build_cnn_input(rgb, self.artifact_mode, sample_path)
 
@@ -297,17 +307,14 @@ class GroupedForgeryDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
         selected_fakes = []
         for method in self.forgery_methods:
             row = random.choice(method_rows[method])
-            fake_source = _resolve(self.data_root, row["fake_path"])
-            with Image.open(fake_source) as image:
-                selected_fakes.append((image.copy(), fake_source))
+            with Image.open(_resolve(self.data_root, row["fake_path"])) as image:
+                selected_fakes.append((image.copy(), row["fake_path"]))
         flip = self.transform.sample_flip()
         crop = self.transform.sample_crop()
-        pairs = [self.transform(real, flip, crop, real_source)] + [
-            self.transform(image, flip, crop, fake_source)
-            for image, fake_source in selected_fakes
-        ]
-        rgb_images = torch.stack([rgb for rgb, _ in pairs])
-        cnn_images = torch.stack([cnn for _, cnn in pairs])
+        images = torch.stack(
+            [self.transform(real, flip, crop, real_path)[0]]
+            + [self.transform(image, flip, crop, path)[0] for image, path in selected_fakes]
+        )
         domain_labels = torch.arange(len(self.forgery_methods) + 1, dtype=torch.long)
         return rgb_images, cnn_images, domain_labels
 
@@ -330,7 +337,6 @@ class FrameFaceDataset(Dataset[tuple[Tensor, Tensor, int, str]]):
 
     def __getitem__(self, index: int) -> tuple[Tensor, Tensor, int, str]:
         row = self.rows[index]
-        source = _resolve(self.data_root, row["path"])
-        with Image.open(source) as image:
-            rgb, cnn = self.transform(image.copy(), sample_path=source)
-        return rgb, cnn, int(row["label"]), row["video_id"]
+        with Image.open(_resolve(self.data_root, row["path"])) as image:
+            tensor = self.transform(image.copy(), sample_path=row["path"])[0]
+        return tensor, int(row["label"]), row["video_id"]
