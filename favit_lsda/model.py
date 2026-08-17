@@ -564,6 +564,11 @@ class ForgeryAwareLSDAViT(nn.Module):
             raise ValueError(
                 f"grouped_images must be [G, {self.num_domains}, 3, H, W]"
             )
+        if grouped_images.shape[2] != 3:
+            raise ValueError(
+                f"grouped_images must be [G, {self.num_domains}, 3, H, W]; "
+                f"got {grouped_images.shape[2]} channels"
+            )
         if grouped_cnn_images.ndim != 5:
             raise ValueError("grouped_cnn_images must be [G, D, C, H, W]")
         if (

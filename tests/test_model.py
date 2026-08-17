@@ -72,6 +72,15 @@ def test_model_rejects_artifact_mode_channel_mismatch():
         _tiny_model("rgb_srm", 3)
 
 
+def test_group_forward_rejects_non_rgb_inputs_before_backbone():
+    """Catches malformed RGB widths reaching Conv2d instead of model validation."""
+    model = _tiny_model()
+    with pytest.raises(ValueError, match=r"grouped_images must be \[G, 3, 3, H, W\]; got 1 channels"):
+        model.forward_group(
+            torch.randn(1, 3, 1, 224, 224), torch.randn(1, 3, 3, 224, 224)
+        )
+
+
 def test_group_invariance_classifier_uses_vit_features_only():
     """Catches domain-adversarial classifier receiving fused CNN features."""
     model = _tiny_model("rgb_fft", 6).eval()
