@@ -9,6 +9,7 @@ from PIL import Image
 from favit_lsda import data
 from favit_lsda.data import (
     FaceTransform,
+    FrameFaceDataset,
     GroupedForgeryDataset,
     artifact_channels,
     build_cnn_input,

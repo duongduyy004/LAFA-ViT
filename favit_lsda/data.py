@@ -309,14 +309,17 @@ class GroupedForgeryDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
         selected_fakes = []
         for method in self.forgery_methods:
             row = random.choice(method_rows[method])
-            with Image.open(_resolve(self.data_root, row["fake_path"])) as image:
-                selected_fakes.append((image.copy(), row["fake_path"]))
+            fake_source = _resolve(self.data_root, row["fake_path"])
+            with Image.open(fake_source) as image:
+                selected_fakes.append((image.copy(), fake_source))
         flip = self.transform.sample_flip()
         crop = self.transform.sample_crop()
-        images = torch.stack(
-            [self.transform(real, flip, crop, real_path)[0]]
-            + [self.transform(image, flip, crop, path)[0] for image, path in selected_fakes]
-        )
+        pairs = [self.transform(real, flip, crop, real_source)] + [
+            self.transform(image, flip, crop, fake_source)
+            for image, fake_source in selected_fakes
+        ]
+        rgb_images = torch.stack([rgb for rgb, _ in pairs])
+        cnn_images = torch.stack([cnn for _, cnn in pairs])
         domain_labels = torch.arange(len(self.forgery_methods) + 1, dtype=torch.long)
         return rgb_images, cnn_images, domain_labels
 
@@ -339,6 +342,7 @@ class FrameFaceDataset(Dataset[tuple[Tensor, Tensor, int, str]]):
 
     def __getitem__(self, index: int) -> tuple[Tensor, Tensor, int, str]:
         row = self.rows[index]
-        with Image.open(_resolve(self.data_root, row["path"])) as image:
-            tensor = self.transform(image.copy(), sample_path=row["path"])[0]
-        return tensor, int(row["label"]), row["video_id"]
+        source = _resolve(self.data_root, row["path"])
+        with Image.open(source) as image:
+            rgb, cnn = self.transform(image.copy(), sample_path=source)
+        return rgb, cnn, int(row["label"]), row["video_id"]
