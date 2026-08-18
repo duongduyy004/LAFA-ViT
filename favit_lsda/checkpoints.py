@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 EXPECTED_ARCHITECTURE = "favit_lsda_cnn"
+SUPPORTED_FORMAT_VERSION = 3
 
 
 def validate_checkpoint_artifacts(
@@ -19,13 +20,17 @@ def validate_checkpoint_artifacts(
 ) -> None:
     """Reject a checkpoint before its state is loaded or used for inference.
 
-    Two independent checks run, in order:
+    Three independent checks run, in order:
 
     1. Legacy architecture rejection: a checkpoint saved before the CNN
        artifact branch existed (``architecture`` other than
        ``"favit_lsda_cnn"``) cannot be resumed or evaluated directly; it must
        be loaded with ``--init-favit`` into a fresh model instead.
-    2. Artifact mismatch rejection: the checkpoint's saved ``artifact_mode``
+    2. Format version rejection: ``format_version`` is written on save but
+       would otherwise never be read back, so a future bump of the on-disk
+       layout would load silently against code that cannot interpret it.
+       Only ``SUPPORTED_FORMAT_VERSION`` is accepted.
+    3. Artifact mismatch rejection: the checkpoint's saved ``artifact_mode``
        and ``cnn_in_channels`` must match what ``model_config`` requests, so
        a checkpoint trained with one CNN artifact mode is never silently
        resumed or evaluated under a different one.
@@ -38,6 +43,15 @@ def validate_checkpoint_artifacts(
             f"checkpoint at {checkpoint_path} has legacy architecture {architecture!r}; "
             f"expected {EXPECTED_ARCHITECTURE!r}. Start a new run and load this "
             "checkpoint with --init-favit instead of --resume or evaluation."
+        )
+
+    format_version = checkpoint.get("format_version")
+    if format_version != SUPPORTED_FORMAT_VERSION:
+        raise ValueError(
+            f"checkpoint at {checkpoint_path} has unsupported format_version "
+            f"{format_version!r}; this build only reads format_version "
+            f"{SUPPORTED_FORMAT_VERSION}. Use a build matching the checkpoint, "
+            "or start a new run and load it with --init-favit."
         )
 
     checkpoint_mode = checkpoint.get("artifact_mode")

@@ -31,12 +31,30 @@ def test_artifact_modes_return_finite_normalized_cnn_inputs(mode, channels):
     assert cnn.shape == (channels, 19, 23)
     assert torch.equal(cnn[:3], rgb)
     assert torch.isfinite(cnn).all()
-    assert -1.0 <= cnn[3:].min() <= cnn[3:].max() <= 1.0
+    # "rgb" derives no extra channels, so cnn[3:] is empty and has no min/max.
+    if channels > 3:
+        assert -1.0 <= cnn[3:].min() <= cnn[3:].max() <= 1.0
 
 
 @pytest.mark.parametrize("mode", ["rgb_srm", "rgb_fft", "rgb_wavelet"])
 def test_constant_artifacts_normalize_to_finite_zero_tensors(mode):
     cnn = build_cnn_input(torch.full((3, 16, 16), 0.25), mode)
+    assert torch.equal(cnn[3:], torch.zeros_like(cnn[3:]))
+
+
+@pytest.mark.parametrize("mode", ["rgb_srm", "rgb_fft", "rgb_wavelet"])
+def test_near_constant_artifacts_are_zeroed_instead_of_amplified(mode):
+    """Catches min-max normalization amplifying float noise to full range.
+
+    Unlike the exactly-constant case above, this input varies -- just by an
+    amount far below any meaningful image signal. Dividing by that span would
+    stretch pure noise across [-1, 1].
+    """
+    torch.manual_seed(0)
+    rgb = torch.full((3, 16, 16), 0.25) + torch.randn(3, 16, 16) * 1e-6
+    assert not torch.equal(rgb, torch.full_like(rgb, 0.25))
+    cnn = build_cnn_input(rgb, mode)
+    assert torch.isfinite(cnn).all()
     assert torch.equal(cnn[3:], torch.zeros_like(cnn[3:]))
 
 

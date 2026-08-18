@@ -48,8 +48,15 @@ def _load_model(
     checkpoint = torch.load(
         checkpoint_path, map_location=device, weights_only=False
     )
+    # Validate against the user-supplied --config, never against the config the
+    # checkpoint carries: comparing the checkpoint's metadata to its own
+    # embedded config is a self-comparison that can never fail, and would let
+    # an evaluation run under a mode/width the caller never asked for.
+    validate_checkpoint_artifacts(checkpoint, config["model"], checkpoint_path)
+    # Only once the request is known to match may the checkpoint's own config
+    # be trusted for construction; it is the more complete record of how the
+    # model was actually built.
     model_config = checkpoint.get("config", config)["model"]
-    validate_checkpoint_artifacts(checkpoint, model_config, checkpoint_path)
     model = build_model_from_config(model_config, pretrained=False).to(device)
     incompatible = model.load_state_dict(checkpoint["model"], strict=False)
     allowed_missing_prefixes = (

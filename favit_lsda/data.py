@@ -32,12 +32,31 @@ def artifact_channels(mode: str) -> int:
         raise ValueError(f"unknown artifact mode: {mode}") from error
 
 
+#: Absolute dynamic-range floor below which a signal counts as constant.
+#:
+#: Artifacts are min-max normalized, which divides by the observed range. An
+#: input whose range is numerically meaningless -- a flat frame carrying only
+#: float noise -- would otherwise have that noise stretched across the full
+#: ``[-1, 1]`` output range. A machine-epsilon test is far too tight for this:
+#: it only catches spans that are *exactly* degenerate, so noise of, say,
+#: ``1e-6`` on a flat image still gets amplified by six orders of magnitude.
+#: Anything at or below this floor normalizes to zero instead. The floor sits
+#: well under any real image signal, where 8-bit quantization alone puts the
+#: smallest representable step near ``8e-3`` after ``[-1, 1]`` normalization.
+_CONSTANT_RANGE_TOLERANCE = 1e-4
+
+
+def _is_constant(value: Tensor) -> bool:
+    """Report whether ``value`` carries no meaningfully distinguishable signal."""
+    return bool(value.amax() - value.amin() <= _CONSTANT_RANGE_TOLERANCE)
+
+
 def _normalize_artifact(value: Tensor) -> Tensor:
     minimum = value.amin(dim=(-2, -1), keepdim=True)
     maximum = value.amax(dim=(-2, -1), keepdim=True)
     span = maximum - minimum
     return torch.where(
-        span > torch.finfo(value.dtype).eps,
+        span > _CONSTANT_RANGE_TOLERANCE,
         2 * (value - minimum) / span - 1,
         torch.zeros_like(value),
     )
@@ -84,7 +103,10 @@ def build_cnn_input(
         raise ValueError(f"{description}: expected floating-point RGB tensor")
     if not torch.isfinite(rgb).all():
         raise ValueError(f"{description}: RGB tensor must be finite")
-    if torch.all(rgb == rgb[..., :1, :1]):
+    if _is_constant(rgb):
+        # Derived artifacts of a (near-)constant frame carry no signal, and some
+        # of them -- FFT especially, whose DC term dwarfs everything else -- have
+        # a wide range even so. Skip them entirely rather than normalizing noise.
         artifacts = [torch.zeros_like(rgb) for _ in layout]
     else:
         builders = {

@@ -86,7 +86,11 @@ def test_group_invariance_classifier_uses_vit_features_only():
     model = _tiny_model("rgb_fft", 6).eval()
     rgb = torch.randn(1, 3, 3, 224, 224)
     cnn = torch.randn(1, 3, 6, 224, 224)
-    with torch.inference_mode():
+    # torch.no_grad rather than torch.inference_mode: this reference pass warms
+    # LocalAdaptiveAttention's lazily cached `relative_indices` buffer, and an
+    # inference-mode tensor there cannot later be reused by the autograd-tracked
+    # forward_group call below.
+    with torch.no_grad():
         cls, patch_maps = model.encode_latents(rgb.flatten(0, 1))
         vit_features, _ = model._student_features(cls, patch_maps)
     captured = []

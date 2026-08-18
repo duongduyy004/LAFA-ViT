@@ -19,7 +19,7 @@ from favit_lsda.config import (
     seed_everything,
     validate_model_config,
 )
-from favit_lsda.data import FaceTransform, FrameFaceDataset, GroupedForgeryDataset, artifact_channels
+from favit_lsda.data import FaceTransform, FrameFaceDataset, GroupedForgeryDataset
 from favit_lsda.engine import evaluate_at_level, train_one_epoch
 from favit_lsda.losses import FineGrainedAdaptiveLoss
 
@@ -178,10 +178,9 @@ def main() -> None:
     train_config = config["train"]
     loss_config = config["loss"]
     validate_model_config(model_config)
+    # Only the transforms need this before the model exists; the saved
+    # checkpoint metadata reads the model's own attributes instead.
     artifact_mode = str(model_config.get("artifact_mode", "rgb"))
-    cnn_in_channels = int(
-        model_config.get("cnn_in_channels", artifact_channels(artifact_mode))
-    )
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "config.yaml").open("w", encoding="utf-8") as handle:
@@ -375,8 +374,11 @@ def main() -> None:
         state = {
             "format_version": 3,
             "architecture": "favit_lsda_cnn",
-            "artifact_mode": artifact_mode,
-            "cnn_in_channels": cnn_in_channels,
+            # Read off the model instance rather than the config-derived locals
+            # so the persisted metadata is definitionally what the model is,
+            # and cannot drift from it via a second resolution site.
+            "artifact_mode": model.artifact_mode,
+            "cnn_in_channels": model.cnn_in_channels,
             "epoch": epoch,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -407,7 +409,9 @@ def main() -> None:
 
     # Evaluate source test and target only once, after source-validation model
     # selection is complete. This prevents either from steering epochs; target
-    # results in particular must never affect checkpoint selection.
+    # results in particular must never affect checkpoint selection. Both run at
+    # image (frame) level, matching selection, as the experiment design requires
+    # every case be compared on image-level source-test and target metrics.
     ffpp_test_manifest = data_config.get("ffpp_test_frames")
     celebdf_test_manifest = data_config.get("celebdf_test_frames")
     if ffpp_test_manifest or celebdf_test_manifest:
@@ -426,7 +430,7 @@ def main() -> None:
                 device,
             )
             ffpp_test_metrics = evaluate_at_level(
-                model, ffpp_loader, device, level="video", description="final test FF++"
+                model, ffpp_loader, device, level="frame", description="final test FF++"
             )
             best_state["ffpp_test_metrics"] = ffpp_test_metrics
             final_record["ffpp_test_metrics"] = ffpp_test_metrics
@@ -439,7 +443,7 @@ def main() -> None:
                 device,
             )
             celebdf_test_metrics = evaluate_at_level(
-                model, celebdf_loader, device, level="video", description="final test CelebDF"
+                model, celebdf_loader, device, level="frame", description="final test CelebDF"
             )
             best_state["celebdf_test_metrics"] = celebdf_test_metrics
             final_record["celebdf_test_metrics"] = celebdf_test_metrics

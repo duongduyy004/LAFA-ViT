@@ -25,7 +25,7 @@ video FF++ / Celeb-DF-v2
           ├─ FF++ validation_frames.csv ─────────> chọn best.pt, early stopping
           │
           └─ Celeb-DF test_frames.csv ───────────> cross-dataset test một lần cuối
-                                                    (AUC/accuracy cấp video)
+                                                    (AUC/accuracy cấp ảnh)
 ```
 
 Protocol đúng là train và chọn checkpoint hoàn toàn trên FF++, sau đó mới dùng
@@ -45,6 +45,12 @@ gradient.
 
 Đường dẫn ảnh trong manifest có thể là đường dẫn tuyệt đối hoặc tương đối với
 `data.root`. Nhãn nhị phân dùng `0 = real`, `1 = fake`.
+
+> **Thay đổi hành vi:** ảnh nguồn không ở mode `RGB` (grayscale, RGBA, CMYK…)
+> nay bị `FaceTransform` từ chối bằng `ValueError` kèm đường dẫn ảnh, thay vì
+> được tự động convert sang RGB như trước. Lý do: artifact SRM/FFT/wavelet được
+> tính trên đúng ba kênh của ảnh nguồn, nên một ảnh bị convert ngầm sẽ tạo
+> artifact không phản ánh dữ liệu thật. Hãy convert sang RGB ở bước preprocess.
 
 ### Tạo group cho LSDA
 
@@ -132,7 +138,9 @@ group [real + 4 fake domains]
    Local Adaptive Module (LAM) bổ sung đặc trưng cục bộ tại ba layer cấu hình.
 2. **Student branch:** `ResidualLatentAdapter` biến đổi patch map bằng residual
    convolution có scale học được. Patch map sau adapter được mean-pool, ghép với
-   CLS token rồi qua `feature_fusion` và binary head.
+   CLS token rồi qua `vit_feature_fusion`. Vector này chưa vào head ngay: nó
+   được ghép với đặc trưng của `ArtifactCNN` rồi đi qua `late_fusion` trước
+   binary head (xem mục 6 bên dưới).
 3. **Domain teacher branches:** một adapter cho real và một adapter riêng cho mỗi
    fake method tạo biểu diễn latent theo miền. Đây là các nhánh auxiliary nhẹ,
    không phải các mạng teacher pretrained độc lập.
@@ -262,12 +270,15 @@ config có khai báo `data.ffpp_test_frames` và/hoặc `data.celebdf_test_frame
 `train.py` nạp lại `best.pt` và đánh giá **một lần duy nhất** trên các manifest
 này, ghi kết quả vào checkpoint (`ffpp_test_metrics`/`celebdf_test_metrics`) và
 `history.jsonl`. Cả hai đều là test post-selection thuần tuý — không backprop,
-không ảnh hưởng tới việc chọn checkpoint hay early stopping.
+không ảnh hưởng tới việc chọn checkpoint hay early stopping. Cả hai cũng chạy ở
+**cấp ảnh** (`evaluate_at_level(..., level="frame")`), giống hệt tín hiệu chọn
+checkpoint, để sáu experiment được so sánh trên cùng một thang đo image-level.
+Nếu cần số liệu cấp video, chạy `evaluate_ffpp.py` / `evaluate_celebdf.py` với
+`--level video` trên `best.pt`.
 
 ## Cài đặt và train
 
 ```powershell
-cd fa_vit_lsda
 pip install -e ".[test]"
 python train.py `
   --config configs/favit_lsda_ffpp_c23_celebdf.yaml `
