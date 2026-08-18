@@ -55,8 +55,12 @@ def _load_model(
     validate_checkpoint_artifacts(checkpoint, config["model"], checkpoint_path)
     # Only once the request is known to match may the checkpoint's own config
     # be trusted for construction; it is the more complete record of how the
-    # model was actually built.
+    # model was actually built. Re-validate it against the checkpoint's
+    # top-level metadata (already proven to match the caller's request above)
+    # so a checkpoint whose nested config was edited out of step with its
+    # top-level fields is still caught before construction.
     model_config = checkpoint.get("config", config)["model"]
+    validate_checkpoint_artifacts(checkpoint, model_config, checkpoint_path)
     model = build_model_from_config(model_config, pretrained=False).to(device)
     incompatible = model.load_state_dict(checkpoint["model"], strict=False)
     allowed_missing_prefixes = (

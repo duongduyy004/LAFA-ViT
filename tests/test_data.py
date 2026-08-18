@@ -2,7 +2,6 @@ import csv
 import random
 
 import pytest
-import pytest
 import torch
 from PIL import Image
 
@@ -58,6 +57,21 @@ def test_near_constant_artifacts_are_zeroed_instead_of_amplified(mode):
     assert torch.equal(cnn[3:], torch.zeros_like(cnn[3:]))
 
 
+@pytest.mark.parametrize("mode", ["rgb_srm", "rgb_fft", "rgb_wavelet"])
+def test_solid_non_gray_frame_is_treated_as_constant(mode):
+    """Catches a per-channel-flat frame slipping past a global-range check.
+
+    Each channel is individually constant, so there is no signal for the
+    derived artifacts to pick up -- even though the channels differ from each
+    other and the *global* min/max range is therefore large.
+    """
+    rgb = torch.stack(
+        [torch.full((16, 16), 0.9), torch.full((16, 16), -0.9), torch.full((16, 16), 0.0)]
+    )
+    cnn = build_cnn_input(rgb, mode)
+    assert torch.equal(cnn[3:], torch.zeros_like(cnn[3:]))
+
+
 def test_unknown_artifact_mode_reports_mode_and_sample_path():
     with pytest.raises(ValueError, match=r"rgb_dct.*bad.png"):
         build_cnn_input(torch.ones(3, 8, 8), "rgb_dct", "bad.png")
@@ -101,9 +115,7 @@ def test_domain_shift_transform_preserves_shape_and_range():
         jpeg_quality_min=30,
     )
     tensor, cnn = transform(Image.new("RGB", (80, 72), "red"))
-    tensor, cnn = transform(Image.new("RGB", (80, 72), "red"))
     assert tensor.shape == (3, 64, 64)
-    assert cnn.shape == tensor.shape
     assert cnn.shape == tensor.shape
     assert torch.isfinite(tensor).all()
     assert -1.0 <= tensor.min() <= tensor.max() <= 1.0

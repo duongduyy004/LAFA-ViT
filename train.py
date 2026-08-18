@@ -19,7 +19,12 @@ from favit_lsda.config import (
     seed_everything,
     validate_model_config,
 )
-from favit_lsda.data import FaceTransform, FrameFaceDataset, GroupedForgeryDataset
+from favit_lsda.data import (
+    FaceTransform,
+    FrameFaceDataset,
+    GroupedForgeryDataset,
+    resolve_artifact_config,
+)
 from favit_lsda.engine import evaluate_at_level, train_one_epoch
 from favit_lsda.losses import FineGrainedAdaptiveLoss
 
@@ -83,6 +88,18 @@ def load_favit_initialization(model: torch.nn.Module, checkpoint_path: Path) -> 
         and target[key].shape == value.shape
         and not key.startswith("head.")
     }
+    shape_mismatches = [
+        key
+        for key, value in source.items()
+        if key in target
+        and target[key].shape != value.shape
+        and not key.startswith("head.")
+    ]
+    if shape_mismatches:
+        print(
+            f"init_favit_checkpoint: skipped {len(shape_mismatches)} shape-mismatched "
+            f"tensor(s), not transferred: {sorted(shape_mismatches)[:10]}"
+        )
     model.load_state_dict(compatible, strict=False)
     return len(compatible)
 
@@ -180,7 +197,7 @@ def main() -> None:
     validate_model_config(model_config)
     # Only the transforms need this before the model exists; the saved
     # checkpoint metadata reads the model's own attributes instead.
-    artifact_mode = str(model_config.get("artifact_mode", "rgb"))
+    artifact_mode, _ = resolve_artifact_config(model_config)
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "config.yaml").open("w", encoding="utf-8") as handle:
@@ -412,41 +429,45 @@ def main() -> None:
     # results in particular must never affect checkpoint selection. Both run at
     # image (frame) level, matching selection, as the experiment design requires
     # every case be compared on image-level source-test and target metrics.
-    ffpp_test_manifest = data_config.get("ffpp_test_frames")
-    celebdf_test_manifest = data_config.get("celebdf_test_frames")
-    if ffpp_test_manifest or celebdf_test_manifest:
+    def _is_selection_manifest(manifest: str | None) -> bool:
+        return bool(manifest) and Path(manifest).resolve() == Path(selection_manifest).resolve()
+
+    final_test_datasets = (
+        ("ffpp_test_frames", "ffpp_test_metrics", "final test FF++"),
+        ("celebdf_test_frames", "celebdf_test_metrics", "final test CelebDF"),
+    )
+    final_manifests = {}
+    for manifest_key, metrics_key, description in final_test_datasets:
+        manifest = data_config.get(manifest_key)
+        if _is_selection_manifest(manifest):
+            print(
+                f"final_evaluation: skipping data.{manifest_key}, it is the same "
+                "file as data.validation_frames"
+            )
+            continue
+        if manifest:
+            final_manifests[metrics_key] = (manifest, description)
+
+    if final_manifests:
         best_path = output_dir / "best.pt"
         if not best_path.is_file():
             raise FileNotFoundError("no best checkpoint is available for final evaluation")
         best_state = torch.load(best_path, map_location=device, weights_only=False)
         model.load_state_dict(best_state["model"])
         final_record: dict = {"event": "final_evaluation"}
-        if ffpp_test_manifest:
-            ffpp_loader = make_frame_loader(
-                ffpp_test_manifest,
+        for metrics_key, (manifest, description) in final_manifests.items():
+            loader = make_frame_loader(
+                manifest,
                 data_config,
                 clean_transform,
                 int(train_config.get("eval_image_batch_size", 32)),
                 device,
             )
-            ffpp_test_metrics = evaluate_at_level(
-                model, ffpp_loader, device, level="frame", description="final test FF++"
+            metrics = evaluate_at_level(
+                model, loader, device, level="frame", description=description
             )
-            best_state["ffpp_test_metrics"] = ffpp_test_metrics
-            final_record["ffpp_test_metrics"] = ffpp_test_metrics
-        if celebdf_test_manifest:
-            celebdf_loader = make_frame_loader(
-                celebdf_test_manifest,
-                data_config,
-                clean_transform,
-                int(train_config.get("eval_image_batch_size", 32)),
-                device,
-            )
-            celebdf_test_metrics = evaluate_at_level(
-                model, celebdf_loader, device, level="frame", description="final test CelebDF"
-            )
-            best_state["celebdf_test_metrics"] = celebdf_test_metrics
-            final_record["celebdf_test_metrics"] = celebdf_test_metrics
+            best_state[metrics_key] = metrics
+            final_record[metrics_key] = metrics
         print(json.dumps(final_record, indent=2))
         with history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(final_record) + "\n")

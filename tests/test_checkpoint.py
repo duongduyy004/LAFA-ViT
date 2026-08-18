@@ -178,12 +178,16 @@ def _write_train_fixture(tmp_path, epochs: int = 2, **extra_data) -> tuple[str, 
         writer.writeheader()
         writer.writerows(pair_rows)
 
-    frames = tmp_path / "frames.csv"
-    with frames.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["path", "label", "video_id"])
-        writer.writeheader()
-        writer.writerow({"path": "real_a.jpg", "label": "0", "video_id": "v0"})
-        writer.writerow({"path": "real_a_DF.jpg", "label": "1", "video_id": "v1"})
+    def _write_frames(name: str) -> Path:
+        path = tmp_path / name
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["path", "label", "video_id"])
+            writer.writeheader()
+            writer.writerow({"path": "real_a.jpg", "label": "0", "video_id": "v0"})
+            writer.writerow({"path": "real_a_DF.jpg", "label": "1", "video_id": "v1"})
+        return path
+
+    frames = _write_frames("frames.csv")
 
     config = {
         "seed": 0,
@@ -195,7 +199,10 @@ def _write_train_fixture(tmp_path, epochs: int = 2, **extra_data) -> tuple[str, 
             "validation_frames": str(frames),
             "image_size": 224,
             "num_workers": 0,
-            **{key: str(frames) for key in extra_data},
+            # Each extra manifest is its own file (identical rows) rather than
+            # reusing `frames`, so it is never mistaken for the same file as
+            # validation_frames by path-equality checks in train.py.
+            **{key: str(_write_frames(f"{key}.csv")) for key in extra_data},
         },
         "model": dict(TINY_MODEL_CONFIG),
         "loss": {},

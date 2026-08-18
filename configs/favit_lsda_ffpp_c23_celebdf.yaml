@@ -5,6 +5,13 @@ output_dir: outputs/favit_lsda_ffpp_c23
 data:
   root: "E:\\Deepfake_Data_Chien\\ffpp_celebdf_data\\processed"
   train_pairs: "E:\\Deepfake_Data_Chien\\ffpp_celebdf_data\\processed\\manifests\\ffpp_c23_train_pairs.csv"
+  # Required: source-domain held-out frame manifest for checkpoint selection
+  # (frame-level AUC). train.py raises ValueError if this is missing; there is
+  # no fallback to Celeb-DF for selection.
+  validation_frames: "E:\\Deepfake_Data_Chien\\ffpp_celebdf_data\\processed\\manifests\\ffpp_c23_val_frames.csv"
+  # Optional dedicated FF++ test manifest, evaluated once after best.pt is
+  # fixed (post-selection only, never affects checkpoint selection).
+  ffpp_test_frames: "E:\\Deepfake_Data_Chien\\ffpp_celebdf_data\\processed\\manifests\\ffpp_c23_test_frames.csv"
   celebdf_test_frames: "E:\\Deepfake_Data_Chien\\ffpp_celebdf_data\\processed\\manifests\\celebdf_test_frames.csv"
   image_size: 224
   num_workers: 4

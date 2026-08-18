@@ -8,7 +8,6 @@ import torch
 from torch import Tensor, nn
 
 from .data import artifact_channels
-from .data import artifact_channels
 from .lsda import LatentSpaceAugmenter, ResidualLatentAdapter
 
 
@@ -235,31 +234,6 @@ class ArtifactCNN(nn.Module):
         return self.project(self.pool(self.blocks(self.stem(images))).flatten(1))
 
 
-class ArtifactCNN(nn.Module):
-    """Independent encoder for RGB-plus-artifact CNN inputs."""
-
-    def __init__(self, in_channels: int, feature_dim: int) -> None:
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-        )
-        self.blocks = nn.Sequential(
-            nn.Conv2d(64, 128, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.GELU(),
-            nn.Conv2d(128, 256, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.GELU(),
-        )
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.project = nn.Linear(256, feature_dim)
-
-    def forward(self, images: Tensor) -> Tensor:
-        return self.project(self.pool(self.blocks(self.stem(images))).flatten(1))
-
-
 class ForgeryAwareLSDAViT(nn.Module):
     """FA-ViT student with LSDA domain teachers and latent augmentation."""
 
@@ -293,8 +267,6 @@ class ForgeryAwareLSDAViT(nn.Module):
         domain_adversarial_strength: float = 1.0,
         artifact_mode: str = "rgb",
         cnn_in_channels: int = 3,
-        artifact_mode: str = "rgb",
-        cnn_in_channels: int = 3,
     ) -> None:
         super().__init__()
         if not hasattr(backbone, "blocks") or not hasattr(backbone, "patch_embed"):
@@ -307,15 +279,7 @@ class ForgeryAwareLSDAViT(nn.Module):
                 "artifact mode/channel mismatch: "
                 f"mode={artifact_mode!r} expects {expected_cnn_channels}, got {cnn_in_channels}"
             )
-        expected_cnn_channels = artifact_channels(artifact_mode)
-        if cnn_in_channels != expected_cnn_channels:
-            raise ValueError(
-                "artifact mode/channel mismatch: "
-                f"mode={artifact_mode!r} expects {expected_cnn_channels}, got {cnn_in_channels}"
-            )
         self.backbone = backbone
-        self.artifact_mode = artifact_mode
-        self.cnn_in_channels = cnn_in_channels
         self.artifact_mode = artifact_mode
         self.cnn_in_channels = cnn_in_channels
         self.embed_dim = int(backbone.embed_dim)
@@ -366,14 +330,6 @@ class ForgeryAwareLSDAViT(nn.Module):
             mixup_concentration_min=mixup_concentration_min,
             mixup_concentration_max=mixup_concentration_max,
         )
-        self.vit_feature_fusion = nn.Sequential(
-            nn.Linear(self.embed_dim * 2, self.embed_dim),
-            nn.LayerNorm(self.embed_dim),
-            nn.GELU(),
-            nn.Dropout(feature_dropout),
-        )
-        self.artifact_cnn = ArtifactCNN(cnn_in_channels, self.embed_dim)
-        self.late_fusion = nn.Sequential(
         self.vit_feature_fusion = nn.Sequential(
             nn.Linear(self.embed_dim * 2, self.embed_dim),
             nn.LayerNorm(self.embed_dim),
@@ -436,9 +392,6 @@ class ForgeryAwareLSDAViT(nn.Module):
             self.vit_feature_fusion,
             self.artifact_cnn,
             self.late_fusion,
-            self.vit_feature_fusion,
-            self.artifact_cnn,
-            self.late_fusion,
             self.head,
             self.domain_classifier,
             self.student_domain_classifier,
@@ -483,36 +436,7 @@ class ForgeryAwareLSDAViT(nn.Module):
         pooled = student_maps.mean(dim=(-2, -1))
         vit_features = self.vit_feature_fusion(torch.cat((cls_features, pooled), dim=1))
         return vit_features, student_maps
-        vit_features = self.vit_feature_fusion(torch.cat((cls_features, pooled), dim=1))
-        return vit_features, student_maps
 
-    def _fused_features(
-        self, cls_features: Tensor, patch_maps: Tensor, cnn_images: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        if cnn_images.ndim != 4:
-            raise ValueError("cnn_images must be [B, C, H, W]")
-        if cnn_images.shape[0] != cls_features.shape[0]:
-            raise ValueError("RGB and CNN inputs must have matching batch sizes")
-        if cnn_images.shape[1] != self.cnn_in_channels:
-            raise ValueError(
-                f"artifact mode {self.artifact_mode!r} expects CNN width "
-                f"{self.cnn_in_channels}, got {cnn_images.shape[1]}"
-            )
-        vit_features, student_maps = self._student_features(cls_features, patch_maps)
-        cnn_features = self.artifact_cnn(cnn_images)
-        return (
-            self.late_fusion(torch.cat((vit_features, cnn_features), dim=1)),
-            vit_features,
-            student_maps,
-        )
-
-    def forward_features(self, images: Tensor, cnn_images: Tensor) -> Tensor:
-        if images.ndim != 4 or images.shape[1] != 3:
-            raise ValueError("images must be [B, 3, H, W]")
-        if cnn_images.ndim != 4 or images.shape[0] != cnn_images.shape[0]:
-            raise ValueError("RGB and CNN inputs must be rank-4 with matching batches")
-        if images.shape[-2:] != cnn_images.shape[-2:]:
-            raise ValueError("RGB and CNN inputs must have matching spatial dimensions")
     def _fused_features(
         self, cls_features: Tensor, patch_maps: Tensor, cnn_images: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -542,21 +466,15 @@ class ForgeryAwareLSDAViT(nn.Module):
             raise ValueError("RGB and CNN inputs must have matching spatial dimensions")
         cls_features, patch_maps = self.encode_latents(images)
         features, _, _ = self._fused_features(cls_features, patch_maps, cnn_images)
-        features, _, _ = self._fused_features(cls_features, patch_maps, cnn_images)
         return features
 
     def forward(
         self, images: Tensor, cnn_images: Tensor, return_features: bool = False
-        self, images: Tensor, cnn_images: Tensor, return_features: bool = False
     ) -> Tensor | tuple[Tensor, Tensor]:
-        features = self.forward_features(images, cnn_images)
         features = self.forward_features(images, cnn_images)
         logits = self.head(features)
         return (logits, features) if return_features else logits
 
-    def forward_group(
-        self, grouped_images: Tensor, grouped_cnn_images: Tensor
-    ) -> dict[str, Tensor]:
     def forward_group(
         self, grouped_images: Tensor, grouped_cnn_images: Tensor
     ) -> dict[str, Tensor]:
@@ -592,16 +510,8 @@ class ForgeryAwareLSDAViT(nn.Module):
                 groups * domains, self.cnn_in_channels, height, width
             ),
         )
-        features, vit_features, student_maps = self._fused_features(
-            cls,
-            patch_maps,
-            grouped_cnn_images.reshape(
-                groups * domains, self.cnn_in_channels, height, width
-            ),
-        )
         grid_h, grid_w = student_maps.shape[-2:]
         features = features.reshape(groups, domains, self.embed_dim)
-        vit_features = vit_features.reshape(groups, domains, self.embed_dim)
         vit_features = vit_features.reshape(groups, domains, self.embed_dim)
         student_maps = student_maps.reshape(
             groups, domains, self.embed_dim, grid_h, grid_w
@@ -624,7 +534,6 @@ class ForgeryAwareLSDAViT(nn.Module):
         teacher_maps = torch.cat((real_teacher.unsqueeze(1), fake_teacher), dim=1)
         domain_logits = self.domain_classifier(teacher_maps.mean(dim=(-2, -1)))
         invariance_logits = self.student_domain_classifier(
-            gradient_reverse(vit_features[:, 1:], self.domain_adversarial_strength)
             gradient_reverse(vit_features[:, 1:], self.domain_adversarial_strength)
         )
         return {
@@ -674,8 +583,6 @@ def create_favit_lsda(
     domain_adversarial_strength: float = 1.0,
     artifact_mode: str = "rgb",
     cnn_in_channels: int = 3,
-    artifact_mode: str = "rgb",
-    cnn_in_channels: int = 3,
 ) -> ForgeryAwareLSDAViT:
     backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
     return ForgeryAwareLSDAViT(
@@ -694,8 +601,6 @@ def create_favit_lsda(
         feature_dropout=feature_dropout,
         unfreeze_last_blocks=unfreeze_last_blocks,
         domain_adversarial_strength=domain_adversarial_strength,
-        artifact_mode=artifact_mode,
-        cnn_in_channels=cnn_in_channels,
         artifact_mode=artifact_mode,
         cnn_in_channels=cnn_in_channels,
     )

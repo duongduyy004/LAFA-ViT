@@ -35,7 +35,7 @@ def validate_checkpoint_artifacts(
        a checkpoint trained with one CNN artifact mode is never silently
        resumed or evaluated under a different one.
     """
-    from .data import artifact_channels
+    from .data import resolve_artifact_config
 
     architecture = checkpoint.get("architecture")
     if architecture != EXPECTED_ARCHITECTURE:
@@ -56,10 +56,7 @@ def validate_checkpoint_artifacts(
 
     checkpoint_mode = checkpoint.get("artifact_mode")
     checkpoint_width = checkpoint.get("cnn_in_channels")
-    config_mode = str(model_config.get("artifact_mode", "rgb"))
-    config_width = int(
-        model_config.get("cnn_in_channels", artifact_channels(config_mode))
-    )
+    config_mode, config_width = resolve_artifact_config(model_config)
     if checkpoint_mode != config_mode or checkpoint_width != config_width:
         raise ValueError(
             "checkpoint/config artifact mismatch: "

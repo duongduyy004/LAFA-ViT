@@ -1,5 +1,4 @@
 import pytest
-import pytest
 import torch
 from torch.nn import functional as F
 
@@ -7,7 +6,6 @@ from favit_lsda.losses import FineGrainedAdaptiveLoss, balanced_binary_cross_ent
 from favit_lsda.model import create_favit_lsda, gradient_reverse
 
 
-def _tiny_model(artifact_mode: str = "rgb", cnn_in_channels: int = 3):
 def _tiny_model(artifact_mode: str = "rgb", cnn_in_channels: int = 3):
     return create_favit_lsda(
         model_name="vit_tiny_patch16_224",
@@ -108,9 +106,7 @@ def test_group_training_forward_and_full_backward():
     model = _tiny_model()
     images = torch.randn(2, 3, 3, 224, 224)
     cnn_images = torch.randn(2, 3, 3, 224, 224)
-    cnn_images = torch.randn(2, 3, 3, 224, 224)
     domain_labels = torch.arange(3).expand(2, -1)
-    output = model.forward_group(images, cnn_images)
     output = model.forward_group(images, cnn_images)
     assert output["logits"].shape == (2, 3, 2)
     assert output["features"].shape == (2, 3, model.embed_dim)
@@ -129,7 +125,6 @@ def test_group_training_forward_and_full_backward():
     loss = binary + domain + output["distill_real"] + output["distill_fake"] + fal
     loss.backward()
     assert model.head.weight.grad is not None
-    assert model.artifact_cnn.stem[0].weight.grad is not None
     assert model.artifact_cnn.stem[0].weight.grad is not None
     assert model.latent_augmenter.comprehensive_fusion[0].weight.grad is not None
 
@@ -153,9 +148,6 @@ def test_inference_uses_single_image_student_path():
     model = _tiny_model().eval()
     with torch.inference_mode():
         logits, features = model(
-            torch.randn(1, 3, 224, 224),
-            torch.randn(1, 3, 224, 224),
-            return_features=True,
             torch.randn(1, 3, 224, 224),
             torch.randn(1, 3, 224, 224),
             return_features=True,

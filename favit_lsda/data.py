@@ -5,14 +5,13 @@ import io
 import random
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import torch
-import torch.nn.functional as F
 import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
-from torchvision.transforms import ColorJitter
 from torchvision.transforms import ColorJitter
 from torchvision.transforms import functional as TF
 from torchvision.transforms.functional import InterpolationMode
@@ -32,6 +31,18 @@ def artifact_channels(mode: str) -> int:
         raise ValueError(f"unknown artifact mode: {mode}") from error
 
 
+def resolve_artifact_config(model_config: dict[str, Any]) -> tuple[str, int]:
+    """Read ``artifact_mode``/``cnn_in_channels`` out of a model config mapping.
+
+    ``cnn_in_channels`` defaults to the width its mode implies, matching every
+    caller's prior ad hoc resolution: config validation, model construction,
+    checkpoint validation, and the training CLI all need this exact pair.
+    """
+    mode = str(model_config.get("artifact_mode", "rgb"))
+    width = int(model_config.get("cnn_in_channels", artifact_channels(mode)))
+    return mode, width
+
+
 #: Absolute dynamic-range floor below which a signal counts as constant.
 #:
 #: Artifacts are min-max normalized, which divides by the observed range. An
@@ -47,8 +58,15 @@ _CONSTANT_RANGE_TOLERANCE = 1e-4
 
 
 def _is_constant(value: Tensor) -> bool:
-    """Report whether ``value`` carries no meaningfully distinguishable signal."""
-    return bool(value.amax() - value.amin() <= _CONSTANT_RANGE_TOLERANCE)
+    """Report whether ``value`` carries no meaningfully distinguishable signal.
+
+    Checked per channel: a frame whose channels are each individually flat but
+    differ from one another (e.g. a solid non-gray color) still has no signal
+    for the derived artifacts to pick up on, even though its global range is
+    large.
+    """
+    per_channel_range = value.amax(dim=(-2, -1)) - value.amin(dim=(-2, -1))
+    return bool(per_channel_range.amax() <= _CONSTANT_RANGE_TOLERANCE)
 
 
 def _normalize_artifact(value: Tensor) -> Tensor:
@@ -138,7 +156,6 @@ class FaceTransform:
         jpeg_probability: float = 0.0,
         jpeg_quality_min: int = 40,
         artifact_mode: str = "rgb",
-        artifact_mode: str = "rgb",
     ) -> None:
         self.image_size = image_size
         self.horizontal_flip = horizontal_flip
@@ -148,8 +165,6 @@ class FaceTransform:
         self.degradation_probability = float(degradation_probability)
         self.jpeg_probability = float(jpeg_probability)
         self.jpeg_quality_min = int(jpeg_quality_min)
-        artifact_channels(artifact_mode)
-        self.artifact_mode = artifact_mode
         artifact_channels(artifact_mode)
         self.artifact_mode = artifact_mode
         probabilities = (
@@ -246,11 +261,6 @@ class FaceTransform:
         if image.mode != "RGB":
             raise ValueError(f"expected RGB image: {sample_path or '<unknown path>'}")
         image = self._resize_crop(image, crop or self.sample_crop())
-        sample_path: str | Path | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        if image.mode != "RGB":
-            raise ValueError(f"expected RGB image: {sample_path or '<unknown path>'}")
-        image = self._resize_crop(image, crop or self.sample_crop())
         if flip:
             image = TF.hflip(image)
         if self.color_jitter is not None:
@@ -258,8 +268,6 @@ class FaceTransform:
         if random.random() < self.grayscale_probability:
             image = TF.rgb_to_grayscale(image, num_output_channels=3)
         image = self._apply_degradation(image)
-        rgb = TF.normalize(TF.to_tensor(image), [0.5] * 3, [0.5] * 3)
-        return rgb, build_cnn_input(rgb, self.artifact_mode, sample_path)
         rgb = TF.normalize(TF.to_tensor(image), [0.5] * 3, [0.5] * 3)
         return rgb, build_cnn_input(rgb, self.artifact_mode, sample_path)
 

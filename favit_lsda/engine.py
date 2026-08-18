@@ -8,7 +8,7 @@ from torch.nn import functional as F
 from tqdm import tqdm
 
 from .losses import FineGrainedAdaptiveLoss, balanced_binary_cross_entropy
-from .metrics import EvaluationLevel, evaluation_metrics, video_level_metrics
+from .metrics import EvaluationLevel, evaluation_metrics
 
 
 def train_one_epoch(
@@ -145,26 +145,3 @@ def evaluate_at_level(
     return evaluation_metrics(
         probabilities, labels, video_ids, level=level, threshold=threshold
     )
-
-
-@torch.inference_mode()
-def evaluate_video_level(
-    model: nn.Module,
-    loader: Iterable[tuple[Tensor, Tensor, Tensor, list[str]]],
-    device: torch.device,
-    description: str = "evaluate",
-) -> dict[str, float | int]:
-    model.eval()
-    probabilities: list[float] = []
-    labels: list[int] = []
-    video_ids: list[str] = []
-    for rgb, cnn, batch_labels, batch_video_ids in tqdm(
-        loader, desc=description, leave=False
-    ):
-        rgb = rgb.to(device, non_blocking=True)
-        cnn = cnn.to(device, non_blocking=True)
-        logits = model(rgb, cnn)
-        probabilities.extend(logits.softmax(dim=1)[:, 1].cpu().tolist())
-        labels.extend(batch_labels.tolist())
-        video_ids.extend(batch_video_ids)
-    return video_level_metrics(probabilities, labels, video_ids)

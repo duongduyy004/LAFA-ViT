@@ -23,9 +23,12 @@ video FF++ / Celeb-DF-v2
           │                                      └─> best.pt / last.pt
           │
           ├─ FF++ validation_frames.csv ─────────> chọn best.pt, early stopping
+          │                                        (AUC cấp ảnh, bắt buộc)
           │
-          └─ Celeb-DF test_frames.csv ───────────> cross-dataset test một lần cuối
-                                                    (AUC/accuracy cấp ảnh)
+          └─ sau khi best.pt cố định, train.py tự chạy post-selection test:
+             ├─ FF++ ffpp_test_frames.csv ────────> test nguồn cùng miền
+             └─ Celeb-DF celebdf_test_frames.csv ─> cross-dataset test
+                (cả hai đều cấp ảnh, một lần duy nhất, không ảnh hưởng selection)
 ```
 
 Protocol đúng là train và chọn checkpoint hoàn toàn trên FF++, sau đó mới dùng
@@ -106,7 +109,7 @@ group [real + 4 fake domains]
               │
               ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│ Shared FA-ViT encoder                                            │
+│ Shared FA-ViT encoder (chỉ nhận RGB 3 kênh)                      │
 │ ViT patch embedding → GAM trong attention blocks                 │
 │ spatial CNN → LAM injection tại layers [0, 3, 6]                 │
 └──────────────────────────────┬───────────────────────────────────┘
@@ -123,11 +126,30 @@ group [real + 4 fake domains]
                  + CLS                │ within + cross    │
                  │                    │ domain + fusion   │
         ┌────────▼────────┐           └─────────┬──────────┘
-        │ Feature fusion  │                     │ target map
-        └──────┬───────┬──┘            MSE distillation
-               │       │                         │
-       binary head     FAL              domain classification
-       real / fake     features          + student GRL branch
+        │ vit_feature_    │                     │ target map
+        │ fusion          │            MSE distillation (real + fake)
+        └────────┬────────┘                     │
+                 │ vit_features        domain classification (teacher maps)
+                 ├────────────────────► student GRL → invariance classifier
+                 │
+                 │   RGB đã augment (xem Augmentation ảnh)
+                 │              │
+                 │              ▼
+                 │      build_cnn_input(mode)
+                 │              │
+                 │              ▼
+                 │      ┌──────────────┐
+                 │      │ ArtifactCNN  │  (độc lập — không chạm
+                 │      └──────┬───────┘   GAM/LAM/LSDA/teacher)
+                 │             │ cnn_features
+                 └──────┬──────┘
+                        ▼
+                  late_fusion (concat + MLP)
+                        │
+               ┌────────┴────────┐
+               ▼                 ▼
+         binary head          FAL features
+         real / fake
 ```
 
 ### Các khối chính
@@ -329,6 +351,50 @@ python train.py `
   --device cuda:0
 ```
 
+### Chạy lần lượt từng case
+
+Mỗi lệnh dưới đây ứng với một trong sáu config ở bảng trên, dùng chung
+`--init-favit`. Sáu case độc lập với nhau — chạy theo thứ tự bất kỳ, chạy lại
+một case không ảnh hưởng các case còn lại vì mỗi case ghi log/checkpoint/
+`history.jsonl` vào `output_dir` riêng.
+
+```powershell
+# 1) rgb
+python train.py --config configs/favit_lsda_cnn_rgb.yaml --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt
+
+# 2) rgb_srm
+python train.py --config configs/favit_lsda_cnn_rgb_srm.yaml --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt
+
+# 3) rgb_fft
+python train.py --config configs/favit_lsda_cnn_rgb_fft.yaml --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt
+
+# 4) rgb_wavelet
+python train.py --config configs/favit_lsda_cnn_rgb_wavelet.yaml --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt
+
+# 5) rgb_srm_fft
+python train.py --config configs/favit_lsda_cnn_rgb_srm_fft.yaml --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt
+
+# 6) rgb_srm_wavelet
+python train.py --config configs/favit_lsda_cnn_rgb_srm_wavelet.yaml --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt
+```
+
+Mỗi lệnh train xong là đủ số liệu so sánh: `outputs/favit_lsda_cnn_<mode>/best.pt`
+và `history.jsonl` đã có sẵn `validation`, `ffpp_test_metrics`,
+`celebdf_test_metrics` — cả ba đều ở cấp frame (xem
+[Validation, checkpoint và cross-test](#validation-checkpoint-và-cross-test)).
+Không cần chạy thêm `evaluate_ffpp.py`/`evaluate_celebdf.py`, trừ khi muốn số
+liệu cấp video hoặc đánh giá lại trên manifest khác — ví dụ với case
+`rgb_srm_fft`:
+
+```powershell
+python evaluate_ffpp.py --config configs/favit_lsda_cnn_rgb_srm_fft.yaml --checkpoint outputs\favit_lsda_cnn_rgb_srm_fft\best.pt --level video
+python evaluate_celebdf.py --config configs/favit_lsda_cnn_rgb_srm_fft.yaml --checkpoint outputs\favit_lsda_cnn_rgb_srm_fft\best.pt --level video
+```
+
+Đổi `rgb_srm_fft` (trong `--config` và `--checkpoint`) thành tên case tương
+ứng cho năm case còn lại. Chi tiết `--level`/định dạng kết quả xem
+[Evaluate](#evaluate).
+
 `--init-favit` chỉ copy các tensor FA-ViT trùng tên **và** trùng shape từ
 checkpoint nguồn (`load_favit_initialization`); binary head luôn bị loại trừ,
 còn `ArtifactCNN`, `late_fusion` và head được khởi tạo mới hoàn toàn — checkpoint
@@ -404,8 +470,9 @@ seed, split, số frame và checkpoint-selection protocol.
 2. Dùng duy nhất FF++ train để backprop và FF++ validation để chọn `best.pt`.
 3. Không điều chỉnh hyperparameter, epoch hay checkpoint theo Celeb-DF test AUC.
 4. Cố định checkpoint rồi mới test trên Celeb-DF-v2, DFDC hoặc WildDeepfake.
-5. Giữ cùng split, số frame và protocol cấp video giữa các phương pháp; chạy ít
-   nhất ba seed và báo cáo mean/std AUC.
+5. Giữ cùng split, số frame và cùng thang đo (mặc định là **cấp ảnh**, khớp tín
+   hiệu chọn checkpoint — xem [Validation, checkpoint và cross-test](#validation-checkpoint-và-cross-test))
+   giữa các phương pháp; chạy ít nhất ba seed và báo cáo mean/std AUC.
 
 Checkpoint format cũ không thể `--resume` với kiến trúc mới; có thể dùng checkpoint
 đó qua `--init-favit` để nạp các tensor tương thích rồi train một run mới.
