@@ -39,9 +39,9 @@ gradient.
 | Trường cấu hình | Cột bắt buộc | Vai trò |
 | --- | --- | --- |
 | `data.train_pairs` | `fake_path,real_path,method` | Tạo các group FF++ dùng cho backprop; `video_id,sample_index` có thể được giữ để truy vết |
-| `data.validation_frames` | `path,label,video_id` | Validation FF++ cấp video để chọn checkpoint và early stopping |
-| `data.ffpp_test_frames` | `path,label,video_id` | FF++ test độc lập cho `evaluate_ffpp.py` (không bắt buộc nếu truyền `--manifest`) |
-| `data.celebdf_test_frames` | `path,label,video_id` | Cross-dataset evaluation trên Celeb-DF-v2 |
+| `data.validation_frames` | `path,label,video_id` | **Bắt buộc.** `train.py` báo lỗi và dừng ngay nếu thiếu trường này. Đây là tín hiệu chọn checkpoint duy nhất: mỗi epoch, `best.pt` được cập nhật theo AUC **cấp frame/image** trên chính manifest FF++ nguồn này (`evaluate_at_level(..., level="frame")`), không dùng Celeb-DF làm fallback |
+| `data.ffpp_test_frames` | `path,label,video_id` | Test FF++ độc lập, chỉ chạy **một lần sau khi** model selection đã kết thúc (post-selection). Không ảnh hưởng tới việc chọn `best.pt`. Dùng cho `evaluate_ffpp.py` (không bắt buộc nếu truyền `--manifest`) |
+| `data.celebdf_test_frames` | `path,label,video_id` | Cross-dataset evaluation trên Celeb-DF-v2, cũng chỉ chạy **một lần sau khi** model selection kết thúc (post-selection). Không bao giờ được dùng để chọn checkpoint |
 
 Đường dẫn ảnh trong manifest có thể là đường dẫn tuyệt đối hoặc tương đối với
 `data.root`. Nhãn nhị phân dùng `0 = real`, `1 = fake`.
@@ -76,13 +76,20 @@ cùng ảnh được chuyển thành tensor và normalize từng kênh bằng me
 Các augmentation mạnh chỉ được bật cho `train_pairs`. Validation và test dùng
 `FaceTransform` sạch, không bật flip, color jitter hay degradation.
 
-> **Lưu ý tránh leakage:** cấu hình mẫu hiện chưa khai báo
-> `data.validation_frames`. Trong trường hợp đó, `train.py` sẽ fallback sang
-> `celebdf_test_frames`, đo Celeb-DF sau mỗi epoch và dùng AUC này để chọn
-> `best.pt`/early stopping. Ảnh Celeb-DF vẫn không backprop, nhưng kết quả test đã
-> ảnh hưởng đến model selection nên không còn là cross-test độc lập. Hãy thêm một
-> manifest validation FF++ được tách theo **video nguồn** trước khi chạy thí nghiệm
-> chính thức.
+Nếu `model.artifact_mode` khác `rgb`, `FaceTransform` xây thêm tensor CNN artifact
+**sau khi** đã áp dụng toàn bộ augmentation/degradation lên RGB (`build_cnn_input`
+nhận RGB đã augment, không phải ảnh gốc). Vì vậy artifact SRM/FFT/wavelet luôn
+phản ánh đúng ảnh mà nhánh CNN quan sát, kể cả khi bị nén JPEG hay hạ độ phân
+giải. Xem chi tiết widths và nhánh CNN ở [Artifact CNN và late fusion](#artifact-cnn-và-late-fusion).
+
+> **Bắt buộc `data.validation_frames`:** `train.py` yêu cầu trường này và báo lỗi
+> ngay khi thiếu (`ValueError`) — không còn fallback sang `celebdf_test_frames` để
+> chọn checkpoint. Đây là thay đổi có chủ đích để loại bỏ leakage: model selection
+> chỉ được phép dựa trên AUC **cấp frame/image** đo trên manifest FF++ nguồn này.
+> Hãy dùng một manifest validation FF++ được tách theo **video nguồn**.
+> `data.ffpp_test_frames` và `data.celebdf_test_frames` chỉ được đánh giá **một
+> lần, sau khi** `best.pt` đã cố định — không bao giờ ảnh hưởng đến việc chọn
+> checkpoint.
 
 ## Kiến trúc mô hình
 
@@ -138,23 +145,64 @@ group [real + 4 fake domains]
    method từ teacher maps. Một classifier khác nhận student fake features qua
    Gradient Reversal Layer (GRL); gradient đảo chiều buộc student giảm thông tin
    đặc thù của từng phương pháp giả mạo.
+6. **Artifact CNN và late fusion:** một `ArtifactCNN` độc lập (stem + hai block
+   conv/BN/GELU + global average pool + linear projection) chạy song song với
+   FA-ViT trên tensor RGB-plus-artifact (`model.artifact_mode`). Vector đặc trưng
+   CNN được nối (`concat`) với CLS+patch feature của FA-ViT rồi qua `late_fusion`
+   (MLP) trước khi vào binary head và FAL. Nhánh này hoàn toàn tách biệt khỏi
+   latent adapter/teacher/LSDA của FA-ViT — augmentation latent-space và distill
+   chỉ tác động lên nhánh ViT, không đụng tới `ArtifactCNN`.
 
 Khác với detector LSDA gốc, phiên bản này không chạy bốn EfficientNet teacher,
 một ArcFace teacher và một student EfficientNet độc lập. Nó dùng một FA-ViT
 encoder chung cùng các latent adapter nhẹ. Đây là thiết kế tích hợp LSDA vào
 FA-ViT, không phải reproduction nguyên xi detector LSDA gốc.
 
+### Artifact CNN và late fusion
+
+`model.artifact_mode` chọn tập artifact ghép vào RGB trước khi đưa vào
+`ArtifactCNN`; `model.cnn_in_channels` phải khớp đúng width tương ứng, được
+kiểm tra bởi `validate_model_config`/`build_model_from_config` (raise
+`ValueError` nếu lệch) trước khi model được khởi tạo:
+
+| `artifact_mode` | Artifact ghép thêm | `cnn_in_channels` |
+| --- | --- | --- |
+| `rgb` | không có | `3` |
+| `rgb_srm` | SRM | `6` |
+| `rgb_fft` | FFT log-magnitude | `6` |
+| `rgb_wavelet` | Haar wavelet detail | `6` |
+| `rgb_srm_fft` | SRM + FFT | `9` |
+| `rgb_srm_wavelet` | SRM + wavelet | `9` |
+
+Mỗi artifact được tính từ RGB **đã augment** (xem
+[Augmentation ảnh](#augmentation-ảnh)), normalize về `[-1, 1]` theo từng ảnh rồi
+`concat` theo kênh sau RGB gốc. Tensor RGB-plus-artifact này chỉ được
+`ArtifactCNN` tiêu thụ; nhánh FA-ViT/GAM/LAM/LSDA phía trên vẫn chỉ nhận RGB ba
+kênh như cũ.
+
 ### Sơ đồ khi inference
 
 ```text
-frame ảnh → shared FA-ViT → student adapter → CLS + pooled patch fusion
-                                                    │
-                                                    ▼
-                                             binary head → P(fake)
+frame ảnh (RGB đã augment/chuẩn hoá)
+        │
+        ├────────────────────────────┐
+        ▼                            ▼
+shared FA-ViT (RGB 3 kênh)   build_cnn_input(mode) → RGB+artifact
+        │                            │
+student adapter                ArtifactCNN
+        │                            │
+CLS + pooled patch feature     CNN feature vector
+        └──────────────┬─────────────┘
+                        ▼
+                  late_fusion (concat + MLP)
+                        │
+                        ▼
+                 binary head → P(fake)
 ```
 
-Teacher adapters, LSDA augmenter, domain classifiers và các auxiliary loss không
-được gọi khi inference.
+Teacher adapters, LSDA augmenter, domain classifiers và các auxiliary loss
+không được gọi khi inference — chỉ hai nhánh RGB FA-ViT và artifact CNN ở trên
+cùng `late_fusion`/binary head chạy.
 
 ## Phương pháp huấn luyện
 
@@ -201,15 +249,20 @@ khi nhận đầy đủ các ràng buộc auxiliary.
 
 ### Validation, checkpoint và cross-test
 
-Sau mỗi epoch, xác suất fake của các frame cùng `video_id` được lấy trung bình để
-tạo xác suất cấp video; từ đó tính `video_auc` và `video_accuracy` (ngưỡng `0.5`).
-`best.pt` được cập nhật khi validation video AUC tăng, `last.pt` luôn lưu trạng
-thái mới nhất và early stopping dựa trên cùng validation AUC.
+`data.validation_frames` là **bắt buộc**; `train.py` raise `ValueError` ngay khi
+config thiếu trường này, không còn fallback sang Celeb-DF. Sau mỗi epoch, model
+được đánh giá trên chính manifest này ở **cấp frame/image**
+(`evaluate_at_level(..., level="frame")`) — không aggregate theo `video_id`.
+`best.pt` được cập nhật khi AUC frame-level trên `validation_frames` tăng,
+`last.pt` luôn lưu trạng thái mới nhất và early stopping dựa trên cùng AUC này.
+Đây là tín hiệu chọn checkpoint duy nhất; Celeb-DF không bao giờ tham gia.
 
-Khi `data.validation_frames` là FF++ validation hợp lệ, Celeb-DF loader tách biệt
-và chỉ được chạy một lần sau khi model selection kết thúc. Script nạp lại
-`best.pt`, đánh giá Celeb-DF và ghi `celebdf_test_metrics` vào checkpoint cũng như
-`history.jsonl`.
+Sau khi vòng lặp train/early-stopping kết thúc (tức `best.pt` đã cố định), nếu
+config có khai báo `data.ffpp_test_frames` và/hoặc `data.celebdf_test_frames`,
+`train.py` nạp lại `best.pt` và đánh giá **một lần duy nhất** trên các manifest
+này, ghi kết quả vào checkpoint (`ffpp_test_metrics`/`celebdf_test_metrics`) và
+`history.jsonl`. Cả hai đều là test post-selection thuần tuý — không backprop,
+không ảnh hưởng tới việc chọn checkpoint hay early stopping.
 
 ## Cài đặt và train
 
@@ -239,10 +292,50 @@ python train.py `
   --device cuda:0
 ```
 
+### Sáu thí nghiệm CNN artifact có kiểm soát
+
+`configs/favit_lsda_cnn_*.yaml` là sáu cấu hình dùng chung seed, optimizer,
+schedule, augmentation, `image_size` và manifest (`train_pairs`,
+`validation_frames`, `ffpp_test_frames`, `celebdf_test_frames`); chỉ
+`model.artifact_mode`, `model.cnn_in_channels` và `output_dir` thay đổi giữa các
+file, để so sánh riêng phần đóng góp của từng loại artifact:
+
+| Config | `artifact_mode` | `cnn_in_channels` | `output_dir` |
+| --- | --- | --- | --- |
+| `configs/favit_lsda_cnn_rgb.yaml` | `rgb` | `3` | `outputs/favit_lsda_cnn_rgb` |
+| `configs/favit_lsda_cnn_rgb_srm.yaml` | `rgb_srm` | `6` | `outputs/favit_lsda_cnn_rgb_srm` |
+| `configs/favit_lsda_cnn_rgb_fft.yaml` | `rgb_fft` | `6` | `outputs/favit_lsda_cnn_rgb_fft` |
+| `configs/favit_lsda_cnn_rgb_wavelet.yaml` | `rgb_wavelet` | `6` | `outputs/favit_lsda_cnn_rgb_wavelet` |
+| `configs/favit_lsda_cnn_rgb_srm_fft.yaml` | `rgb_srm_fft` | `9` | `outputs/favit_lsda_cnn_rgb_srm_fft` |
+| `configs/favit_lsda_cnn_rgb_srm_wavelet.yaml` | `rgb_srm_wavelet` | `9` | `outputs/favit_lsda_cnn_rgb_srm_wavelet` |
+
+Train một thí nghiệm CNN artifact, khởi tạo từ checkpoint `fa_vit_remake`:
+
+```powershell
+python train.py `
+  --config configs/favit_lsda_cnn_rgb_srm_fft.yaml `
+  --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt `
+  --device cuda:0
+```
+
+`--init-favit` chỉ copy các tensor FA-ViT trùng tên **và** trùng shape từ
+checkpoint nguồn (`load_favit_initialization`); binary head luôn bị loại trừ,
+còn `ArtifactCNN`, `late_fusion` và head được khởi tạo mới hoàn toàn — checkpoint
+`fa_vit_remake` không có các nhánh này nên không kiểm tra `artifact_mode`/
+`cnn_in_channels` ở bước này.
+
+`--resume` thì ngược lại: nghiêm ngặt hơn có chủ đích
+(`validate_checkpoint_artifacts`). Nó từ chối checkpoint có `architecture` khác
+`"favit_lsda_cnn"` (checkpoint cũ trước khi có nhánh CNN) và từ chối checkpoint
+có `artifact_mode`/`cnn_in_channels` khác với config hiện tại — một checkpoint
+train với `rgb_srm` không thể `--resume` dưới config `rgb_fft`. Với checkpoint
+không tương thích, dùng `--init-favit` để bắt đầu run mới thay vì `--resume`.
+
 ## Evaluate
 
-Inference chỉ giữ shared FA-ViT, student adapter, feature fusion và binary head;
-latent augmentation/domain teachers không chạy.
+Inference chỉ giữ shared FA-ViT, student adapter, `ArtifactCNN`, `late_fusion`
+và binary head; latent augmentation/domain teachers không chạy (xem
+[Sơ đồ khi inference](#sơ-đồ-khi-inference)).
 
 Đánh giá FF++ ở video level:
 

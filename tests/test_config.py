@@ -1,6 +1,26 @@
+from pathlib import Path
+
 import pytest
 
-from favit_lsda.config import validate_model_config
+from favit_lsda.config import load_config, validate_model_config
+
+
+@pytest.mark.parametrize(
+    ("name", "mode", "channels"),
+    [
+        ("rgb", "rgb", 3), ("rgb_srm", "rgb_srm", 6),
+        ("rgb_fft", "rgb_fft", 6), ("rgb_wavelet", "rgb_wavelet", 6),
+        ("rgb_srm_fft", "rgb_srm_fft", 9),
+        ("rgb_srm_wavelet", "rgb_srm_wavelet", 9),
+    ],
+)
+def test_cnn_experiment_config_has_exact_mapping(name, mode, channels):
+    config = load_config(Path("configs") / f"favit_lsda_cnn_{name}.yaml")
+    validate_model_config(config["model"])
+    assert config["model"]["artifact_mode"] == mode
+    assert config["model"]["cnn_in_channels"] == channels
+    assert config["output_dir"] == f"outputs/favit_lsda_cnn_{name}"
+    assert config["data"]["validation_frames"].endswith("ffpp_c23_val_frames.csv")
 
 
 def test_model_config_rejects_artifact_width_mismatch():
