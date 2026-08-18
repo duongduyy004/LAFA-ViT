@@ -1,9 +1,73 @@
 import csv
+import random
 
+import pytest
 import torch
 from PIL import Image
 
-from favit_lsda.data import FaceTransform, GroupedForgeryDataset
+from favit_lsda import data
+from favit_lsda.data import (
+    FaceTransform,
+    FrameFaceDataset,
+    GroupedForgeryDataset,
+    artifact_channels,
+    build_cnn_input,
+)
+
+
+@pytest.mark.parametrize(
+    ("mode", "channels"),
+    [
+        ("rgb", 3), ("rgb_srm", 6), ("rgb_fft", 6),
+        ("rgb_wavelet", 6), ("rgb_srm_fft", 9),
+        ("rgb_srm_wavelet", 9),
+    ],
+)
+def test_artifact_modes_return_finite_normalized_cnn_inputs(mode, channels):
+    rgb = torch.linspace(-1, 1, 3 * 19 * 23).reshape(3, 19, 23)
+    cnn = build_cnn_input(rgb, mode)
+    assert artifact_channels(mode) == channels
+    assert cnn.shape == (channels, 19, 23)
+    assert torch.equal(cnn[:3], rgb)
+    assert torch.isfinite(cnn).all()
+    assert -1.0 <= cnn[3:].min() <= cnn[3:].max() <= 1.0
+
+
+@pytest.mark.parametrize("mode", ["rgb_srm", "rgb_fft", "rgb_wavelet"])
+def test_constant_artifacts_normalize_to_finite_zero_tensors(mode):
+    cnn = build_cnn_input(torch.full((3, 16, 16), 0.25), mode)
+    assert torch.equal(cnn[3:], torch.zeros_like(cnn[3:]))
+
+
+def test_unknown_artifact_mode_reports_mode_and_sample_path():
+    with pytest.raises(ValueError, match=r"rgb_dct.*bad.png"):
+        build_cnn_input(torch.ones(3, 8, 8), "rgb_dct", "bad.png")
+
+
+def test_invalid_artifact_input_reports_mode_and_sample_path():
+    with pytest.raises(ValueError, match=r"rgb_fft.*bad.png"):
+        build_cnn_input(torch.ones(1, 8, 8), "rgb_fft", "bad.png")
+    with pytest.raises(ValueError, match="unknown artifact mode: rgb_dct"):
+        artifact_channels("rgb_dct")
+
+
+def test_rgb_mode_skips_derived_artifact_builders(monkeypatch):
+    def fail(*_args):
+        raise AssertionError("derived artifact builder invoked")
+
+    monkeypatch.setattr(data, "_srm_artifact", fail)
+    monkeypatch.setattr(data, "_fft_artifact", fail)
+    monkeypatch.setattr(data, "_wavelet_artifact", fail)
+    rgb = torch.linspace(-1, 1, 3 * 8 * 8).reshape(3, 8, 8)
+    assert torch.equal(build_cnn_input(rgb, "rgb"), rgb)
+
+
+def test_transform_returns_rgb_and_artifact_tensor_after_augmentation():
+    transform = FaceTransform(32, color_jitter=0.2, jpeg_probability=1.0, artifact_mode="rgb_srm")
+    rgb, cnn = transform(Image.new("RGB", (40, 36), "red"), sample_path="face.jpg")
+    assert rgb.shape == (3, 32, 32)
+    assert cnn.shape == (6, 32, 32)
+    assert torch.equal(cnn[:3], rgb)
 
 
 def test_domain_shift_transform_preserves_shape_and_range():
@@ -17,13 +81,14 @@ def test_domain_shift_transform_preserves_shape_and_range():
         jpeg_probability=1.0,
         jpeg_quality_min=30,
     )
-    tensor = transform(Image.new("RGB", (80, 72), "red"))
+    tensor, cnn = transform(Image.new("RGB", (80, 72), "red"))
     assert tensor.shape == (3, 64, 64)
+    assert cnn.shape == tensor.shape
     assert torch.isfinite(tensor).all()
     assert -1.0 <= tensor.min() <= tensor.max() <= 1.0
 
 
-def test_grouped_dataset_builds_canonical_real_fake_domains(tmp_path):
+def _write_group_manifest(tmp_path):
     Image.new("RGB", (20, 20), "white").save(tmp_path / "real.jpg")
     methods = ("Deepfakes", "Face2Face")
     rows = []
@@ -40,12 +105,70 @@ def test_grouped_dataset_builds_canonical_real_fake_domains(tmp_path):
         )
         writer.writeheader()
         writer.writerows(rows)
+    return manifest, methods
+
+
+def test_grouped_dataset_builds_canonical_real_fake_domains(tmp_path):
+    manifest, methods = _write_group_manifest(tmp_path)
     dataset = GroupedForgeryDataset(
         manifest, tmp_path, FaceTransform(224), forgery_methods=methods
     )
-    images, labels = dataset[0]
-    assert images.shape == (3, 3, 224, 224)
+    rgb, cnn, labels = dataset[0]
+    assert rgb.shape == (3, 3, 224, 224)
+    assert torch.equal(cnn, rgb)
     assert torch.equal(labels, torch.tensor([0, 1, 2]))
+
+
+def test_grouped_dataset_returns_rgb_cnn_and_shared_group_geometry(tmp_path):
+    manifest, methods = _write_group_manifest(tmp_path)
+    dataset = GroupedForgeryDataset(
+        manifest,
+        tmp_path,
+        FaceTransform(32, crop_scale_min=0.75, artifact_mode="rgb_fft"),
+        methods,
+    )
+    rgb, cnn, labels = dataset[0]
+    assert rgb.shape == (3, 3, 32, 32)
+    assert cnn.shape == (3, 6, 32, 32)
+    assert torch.equal(cnn[:, :3], rgb)
+    assert torch.equal(labels, torch.tensor([0, 1, 2]))
+
+
+def test_artifact_mode_does_not_change_augmented_rgb_rng_sequence(tmp_path):
+    manifest, methods = _write_group_manifest(tmp_path)
+    random.seed(11); torch.manual_seed(11)
+    rgb_a, cnn_a, _ = GroupedForgeryDataset(
+        manifest,
+        tmp_path,
+        FaceTransform(32, color_jitter=0.2, jpeg_probability=1.0, artifact_mode="rgb"),
+        methods,
+    )[0]
+    random.seed(11); torch.manual_seed(11)
+    rgb_b, cnn_b, _ = GroupedForgeryDataset(
+        manifest,
+        tmp_path,
+        FaceTransform(32, color_jitter=0.2, jpeg_probability=1.0, artifact_mode="rgb_srm_fft"),
+        methods,
+    )[0]
+    assert torch.equal(rgb_a, rgb_b)
+    assert torch.equal(cnn_a, rgb_a)
+    assert cnn_b.shape[1] == 9
+
+
+def test_frame_dataset_returns_rgb_cnn_label_and_video_id(tmp_path):
+    Image.new("RGB", (20, 20), "white").save(tmp_path / "face.jpg")
+    manifest = tmp_path / "frames.csv"
+    with manifest.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["path", "label", "video_id"])
+        writer.writeheader()
+        writer.writerow({"path": "face.jpg", "label": "1", "video_id": "video"})
+    rgb, cnn, label, video_id = FrameFaceDataset(
+        manifest, tmp_path, FaceTransform(32, artifact_mode="rgb_srm")
+    )[0]
+    assert rgb.shape == (3, 32, 32)
+    assert cnn.shape == (6, 32, 32)
+    assert torch.equal(cnn[:3], rgb)
+    assert (label, video_id) == (1, "video")
 
 
 def test_incomplete_domain_groups_are_reported_and_dropped(tmp_path):

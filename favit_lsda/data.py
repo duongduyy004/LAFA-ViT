@@ -7,12 +7,91 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
-from torchvision.transforms import functional as TF
 from torchvision.transforms import ColorJitter
+from torchvision.transforms import functional as TF
 from torchvision.transforms.functional import InterpolationMode
+
+
+_ARTIFACT_LAYOUTS = {
+    "rgb": (), "rgb_srm": ("srm",), "rgb_fft": ("fft",),
+    "rgb_wavelet": ("wavelet",), "rgb_srm_fft": ("srm", "fft"),
+    "rgb_srm_wavelet": ("srm", "wavelet"),
+}
+
+
+def artifact_channels(mode: str) -> int:
+    try:
+        return 3 * (1 + len(_ARTIFACT_LAYOUTS[mode]))
+    except KeyError as error:
+        raise ValueError(f"unknown artifact mode: {mode}") from error
+
+
+def _normalize_artifact(value: Tensor) -> Tensor:
+    minimum = value.amin(dim=(-2, -1), keepdim=True)
+    maximum = value.amax(dim=(-2, -1), keepdim=True)
+    span = maximum - minimum
+    return torch.where(
+        span > torch.finfo(value.dtype).eps,
+        2 * (value - minimum) / span - 1,
+        torch.zeros_like(value),
+    )
+
+
+def _srm_artifact(rgb: Tensor) -> Tensor:
+    kernel = rgb.new_tensor(
+        [[0, 0, 0, 0, 0], [0, -1, 2, -1, 0], [0, 2, -4, 2, 0],
+         [0, -1, 2, -1, 0], [0, 0, 0, 0, 0]]
+    ).expand(3, 1, 5, 5)
+    return F.conv2d(rgb.unsqueeze(0), kernel, padding=2, groups=3).squeeze(0)
+
+
+def _fft_artifact(rgb: Tensor) -> Tensor:
+    return torch.fft.fftshift(
+        torch.log1p(torch.abs(torch.fft.fft2(rgb))), dim=(-2, -1)
+    )
+
+
+def _wavelet_artifact(rgb: Tensor) -> Tensor:
+    height, width = rgb.shape[-2:]
+    padded = F.pad(rgb, (0, width % 2, 0, height % 2), mode="replicate")
+    even_even, even_odd = padded[..., 0::2, 0::2], padded[..., 0::2, 1::2]
+    odd_even, odd_odd = padded[..., 1::2, 0::2], padded[..., 1::2, 1::2]
+    details = (
+        even_even - even_odd + odd_even - odd_odd
+        + even_even + even_odd - odd_even - odd_odd
+        + even_even - even_odd - odd_even + odd_odd
+    )
+    return details.repeat_interleave(2, -2).repeat_interleave(2, -1)[..., :height, :width]
+
+
+def build_cnn_input(
+    rgb: Tensor, mode: str, sample_path: str | Path | None = None
+) -> Tensor:
+    description = f"artifact mode {mode!r} for {sample_path or '<unknown path>'}"
+    try:
+        layout = _ARTIFACT_LAYOUTS[mode]
+    except KeyError as error:
+        raise ValueError(f"{description}: unknown artifact mode") from error
+    if rgb.ndim != 3 or rgb.shape[0] != 3:
+        raise ValueError(f"{description}: expected RGB tensor with shape [3, H, W]")
+    if not rgb.is_floating_point():
+        raise ValueError(f"{description}: expected floating-point RGB tensor")
+    if not torch.isfinite(rgb).all():
+        raise ValueError(f"{description}: RGB tensor must be finite")
+    if torch.all(rgb == rgb[..., :1, :1]):
+        artifacts = [torch.zeros_like(rgb) for _ in layout]
+    else:
+        builders = {
+            "srm": _srm_artifact,
+            "fft": _fft_artifact,
+            "wavelet": _wavelet_artifact,
+        }
+        artifacts = [builders[name](rgb) for name in layout]
+    return torch.cat([rgb] + [_normalize_artifact(artifact) for artifact in artifacts])
 
 
 class FaceTransform:
@@ -34,6 +113,7 @@ class FaceTransform:
         degradation_probability: float = 0.0,
         jpeg_probability: float = 0.0,
         jpeg_quality_min: int = 40,
+        artifact_mode: str = "rgb",
     ) -> None:
         self.image_size = image_size
         self.horizontal_flip = horizontal_flip
@@ -43,6 +123,8 @@ class FaceTransform:
         self.degradation_probability = float(degradation_probability)
         self.jpeg_probability = float(jpeg_probability)
         self.jpeg_quality_min = int(jpeg_quality_min)
+        artifact_channels(artifact_mode)
+        self.artifact_mode = artifact_mode
         probabilities = (
             horizontal_flip,
             grayscale_probability,
@@ -132,8 +214,11 @@ class FaceTransform:
         image: Image.Image,
         flip: bool = False,
         crop: tuple[float, float, float] | None = None,
-    ) -> Tensor:
-        image = self._resize_crop(image.convert("RGB"), crop or self.sample_crop())
+        sample_path: str | Path | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if image.mode != "RGB":
+            raise ValueError(f"expected RGB image: {sample_path or '<unknown path>'}")
+        image = self._resize_crop(image, crop or self.sample_crop())
         if flip:
             image = TF.hflip(image)
         if self.color_jitter is not None:
@@ -141,7 +226,8 @@ class FaceTransform:
         if random.random() < self.grayscale_probability:
             image = TF.rgb_to_grayscale(image, num_output_channels=3)
         image = self._apply_degradation(image)
-        return TF.normalize(TF.to_tensor(image), [0.5] * 3, [0.5] * 3)
+        rgb = TF.normalize(TF.to_tensor(image), [0.5] * 3, [0.5] * 3)
+        return rgb, build_cnn_input(rgb, self.artifact_mode, sample_path)
 
 
 def _read_manifest(path: str | Path) -> list[dict[str, str]]:
@@ -157,7 +243,7 @@ def _resolve(root: Path, value: str) -> Path:
     return path if path.is_absolute() else root / path
 
 
-class GroupedForgeryDataset(Dataset[tuple[Tensor, Tensor]]):
+class GroupedForgeryDataset(Dataset[tuple[Tensor, Tensor, Tensor]]):
     """Build LSDA groups in canonical order: real, then each forgery method."""
 
     REQUIRED_COLUMNS = {"fake_path", "real_path", "method"}
@@ -203,26 +289,30 @@ class GroupedForgeryDataset(Dataset[tuple[Tensor, Tensor]]):
     def __len__(self) -> int:
         return len(self.groups)
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor]:
         real_path, method_rows = self.groups[index]
-        with Image.open(_resolve(self.data_root, real_path)) as image:
+        real_source = _resolve(self.data_root, real_path)
+        with Image.open(real_source) as image:
             real = image.copy()
         selected_fakes = []
         for method in self.forgery_methods:
             row = random.choice(method_rows[method])
-            with Image.open(_resolve(self.data_root, row["fake_path"])) as image:
-                selected_fakes.append(image.copy())
+            fake_source = _resolve(self.data_root, row["fake_path"])
+            with Image.open(fake_source) as image:
+                selected_fakes.append((image.copy(), fake_source))
         flip = self.transform.sample_flip()
         crop = self.transform.sample_crop()
-        images = torch.stack(
-            [self.transform(real, flip, crop)]
-            + [self.transform(image, flip, crop) for image in selected_fakes]
-        )
+        pairs = [self.transform(real, flip, crop, real_source)] + [
+            self.transform(image, flip, crop, fake_source)
+            for image, fake_source in selected_fakes
+        ]
+        rgb_images = torch.stack([rgb for rgb, _ in pairs])
+        cnn_images = torch.stack([cnn for _, cnn in pairs])
         domain_labels = torch.arange(len(self.forgery_methods) + 1, dtype=torch.long)
-        return images, domain_labels
+        return rgb_images, cnn_images, domain_labels
 
 
-class FrameFaceDataset(Dataset[tuple[Tensor, int, str]]):
+class FrameFaceDataset(Dataset[tuple[Tensor, Tensor, int, str]]):
     REQUIRED_COLUMNS = {"path", "label", "video_id"}
 
     def __init__(
@@ -238,8 +328,9 @@ class FrameFaceDataset(Dataset[tuple[Tensor, int, str]]):
     def __len__(self) -> int:
         return len(self.rows)
 
-    def __getitem__(self, index: int) -> tuple[Tensor, int, str]:
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, int, str]:
         row = self.rows[index]
-        with Image.open(_resolve(self.data_root, row["path"])) as image:
-            tensor = self.transform(image.copy())
-        return tensor, int(row["label"]), row["video_id"]
+        source = _resolve(self.data_root, row["path"])
+        with Image.open(source) as image:
+            rgb, cnn = self.transform(image.copy(), sample_path=source)
+        return rgb, cnn, int(row["label"]), row["video_id"]
