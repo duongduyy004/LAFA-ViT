@@ -175,13 +175,17 @@ group [real + 4 fake domains]
    method từ teacher maps. Một classifier khác nhận student fake features qua
    Gradient Reversal Layer (GRL); gradient đảo chiều buộc student giảm thông tin
    đặc thù của từng phương pháp giả mạo.
-6. **Artifact CNN và late fusion:** một `ArtifactCNN` độc lập (stem + hai block
-   conv/BN/GELU + global average pool + linear projection) chạy song song với
-   FA-ViT trên tensor RGB-plus-artifact (`model.artifact_mode`). Vector đặc trưng
-   CNN được nối (`concat`) với CLS+patch feature của FA-ViT rồi qua `late_fusion`
-   (MLP) trước khi vào binary head và FAL. Nhánh này hoàn toàn tách biệt khỏi
-   latent adapter/teacher/LSDA của FA-ViT — augmentation latent-space và distill
-   chỉ tác động lên nhánh ViT, không đụng tới `ArtifactCNN`.
+6. **Artifact CNN và late fusion:** một `ArtifactCNN` (`favit_lsda/model.py`)
+   chạy **song song, độc lập hoàn toàn** với FA-ViT, không phải một nhánh phụ
+   trợ bên trong FA-ViT. Chi tiết ở [Artifact CNN và late fusion](#artifact-cnn-và-late-fusion)
+   bên dưới. Vector đặc trưng CNN được nối (`concat`) với `vit_features`
+   (CLS+patch feature sau `vit_feature_fusion`, mục 2) rồi qua `late_fusion`
+   (MLP) trước khi vào binary head và FAL — đây là **điểm duy nhất** hai nhánh
+   gặp nhau. Không nhánh nào khác (student adapter, teacher, LSDA augmenter,
+   domain classifier, invariance classifier, MSE distillation ở mục 3-5) đọc
+   hoặc ghi vào `ArtifactCNN`/`cnn_images`, và ngược lại `ArtifactCNN` không
+   đọc CLS/patch map của FA-ViT — mỗi nhánh chỉ thấy tensor đầu vào của riêng
+   mình.
 
 Khác với detector LSDA gốc, phiên bản này không chạy bốn EfficientNet teacher,
 một ArcFace teacher và một student EfficientNet độc lập. Nó dùng một FA-ViT
@@ -189,6 +193,13 @@ encoder chung cùng các latent adapter nhẹ. Đây là thiết kế tích hợ
 FA-ViT, không phải reproduction nguyên xi detector LSDA gốc.
 
 ### Artifact CNN và late fusion
+
+> **Đừng nhầm với "spatial CNN" ở mục 1:** FA-ViT có sẵn một CNN nội bộ
+> (`SpatialCNN`, cấp đặc trưng cho LAM injection) chỉ nhận **RGB 3 kênh** và là
+> một phần của shared encoder. `ArtifactCNN` là một module **hoàn toàn khác**,
+> đứng ngoài FA-ViT, nhận tensor RGB-plus-artifact (`C` kênh tuỳ
+> `model.artifact_mode`, xem bảng dưới) và không chia sẻ weight hay input với
+> `SpatialCNN`.
 
 `model.artifact_mode` chọn tập artifact ghép vào RGB trước khi đưa vào
 `ArtifactCNN`; `model.cnn_in_channels` phải khớp đúng width tương ứng, được
@@ -206,9 +217,28 @@ kiểm tra bởi `validate_model_config`/`build_model_from_config` (raise
 
 Mỗi artifact được tính từ RGB **đã augment** (xem
 [Augmentation ảnh](#augmentation-ảnh)), normalize về `[-1, 1]` theo từng ảnh rồi
-`concat` theo kênh sau RGB gốc. Tensor RGB-plus-artifact này chỉ được
-`ArtifactCNN` tiêu thụ; nhánh FA-ViT/GAM/LAM/LSDA phía trên vẫn chỉ nhận RGB ba
-kênh như cũ.
+`concat` theo kênh sau RGB gốc. Tensor RGB-plus-artifact `[C, 224, 224]` này
+chỉ được `ArtifactCNN` tiêu thụ; nhánh FA-ViT/GAM/LAM/LSDA phía trên vẫn chỉ
+nhận RGB ba kênh như cũ, không bao giờ thấy các kênh artifact.
+
+`ArtifactCNN` (`favit_lsda/model.py:ArtifactCNN`) là một CNN tuần tự nông,
+không liên quan tới backbone ViT:
+
+```text
+input [B, C, 224, 224]                 C = cnn_in_channels (3/6/9)
+  │
+  ▼ stem:    Conv2d(C→64,   k3 s2) → BatchNorm → GELU        # 224 → 112
+  ▼ blocks:  Conv2d(64→128, k3 s2) → BatchNorm → GELU        # 112 → 56
+             Conv2d(128→256,k3 s2) → BatchNorm → GELU        # 56  → 28
+  ▼ pool:    AdaptiveAvgPool2d(1) → flatten
+  ▼ project: Linear(256 → embed_dim)
+output [B, embed_dim]                  embed_dim khớp FA-ViT (768 với vit_base)
+```
+
+`project` chiếu đặc trưng CNN về đúng `embed_dim` của backbone ViT, để
+`late_fusion` có thể `concat` hai vector cùng chiều mà không cần thêm phép
+chiếu nào khác. Toàn bộ `ArtifactCNN` (stem, blocks, project) luôn trainable —
+không bị freeze như phần lớn backbone FA-ViT (xem `_set_trainable_parameters`).
 
 ### Sơ đồ khi inference
 
