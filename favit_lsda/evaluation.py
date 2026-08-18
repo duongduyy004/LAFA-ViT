@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
+from .checkpoints import validate_checkpoint_artifacts
 from .config import build_model_from_config, load_config, resolve_device
 from .data import FaceTransform, FrameFaceDataset
 from .engine import evaluate_at_level
@@ -47,10 +48,8 @@ def _load_model(
     checkpoint = torch.load(
         checkpoint_path, map_location=device, weights_only=False
     )
-    if checkpoint.get("architecture") not in (None, "favit_lsda"):
-        raise ValueError("checkpoint is not a FA-ViT + LSDA checkpoint")
-
     model_config = checkpoint.get("config", config)["model"]
+    validate_checkpoint_artifacts(checkpoint, model_config, checkpoint_path)
     model = build_model_from_config(model_config, pretrained=False).to(device)
     incompatible = model.load_state_dict(checkpoint["model"], strict=False)
     allowed_missing_prefixes = (
@@ -116,7 +115,10 @@ def run_evaluation(
     dataset = FrameFaceDataset(
         manifest,
         data_config["root"],
-        FaceTransform(int(data_config.get("image_size", 224))),
+        FaceTransform(
+            int(data_config.get("image_size", 224)),
+            artifact_mode=model.artifact_mode,
+        ),
     )
     batch_size = (
         args.batch_size

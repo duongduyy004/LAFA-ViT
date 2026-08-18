@@ -8,11 +8,19 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 from torch.utils.data import DataLoader
 
-from favit_lsda.config import build_model_from_config, load_config, resolve_device, seed_everything
-from favit_lsda.data import FaceTransform, FrameFaceDataset, GroupedForgeryDataset
-from favit_lsda.engine import evaluate_video_level, train_one_epoch
+from favit_lsda.checkpoints import validate_checkpoint_artifacts
+from favit_lsda.config import (
+    build_model_from_config,
+    load_config,
+    resolve_device,
+    seed_everything,
+    validate_model_config,
+)
+from favit_lsda.data import FaceTransform, FrameFaceDataset, GroupedForgeryDataset, artifact_channels
+from favit_lsda.engine import evaluate_at_level, train_one_epoch
 from favit_lsda.losses import FineGrainedAdaptiveLoss
 
 
@@ -59,13 +67,21 @@ def restore_random_state(state: dict | None) -> None:
 
 
 def load_favit_initialization(model: torch.nn.Module, checkpoint_path: Path) -> int:
+    """Load only matching name-and-shape FA-ViT tensors from a source checkpoint.
+
+    The classification head is always excluded so it stays freshly
+    initialized: CNN artifact branch, late fusion, and the binary head have
+    no counterpart worth transplanting from a FA-ViT-only source checkpoint.
+    """
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     source = checkpoint.get("model", checkpoint)
     target = model.state_dict()
     compatible = {
         key: value
         for key, value in source.items()
-        if key in target and target[key].shape == value.shape
+        if key in target
+        and target[key].shape == value.shape
+        and not key.startswith("head.")
     }
     model.load_state_dict(compatible, strict=False)
     return len(compatible)
@@ -161,8 +177,15 @@ def main() -> None:
     model_config = config["model"]
     train_config = config["train"]
     loss_config = config["loss"]
+    validate_model_config(model_config)
+    artifact_mode = str(model_config.get("artifact_mode", "rgb"))
+    cnn_in_channels = int(
+        model_config.get("cnn_in_channels", artifact_channels(artifact_mode))
+    )
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "config.yaml").open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(config, handle, sort_keys=False)
 
     methods = tuple(model_config.get(
         "forgery_methods", ["Deepfakes", "Face2Face", "FaceSwap", "NeuralTextures"]
@@ -186,6 +209,7 @@ def main() -> None:
         ),
         jpeg_probability=float(augmentation.get("jpeg_probability", 0.0)),
         jpeg_quality_min=int(augmentation.get("jpeg_quality_min", 40)),
+        artifact_mode=artifact_mode,
     )
     train_dataset = GroupedForgeryDataset(
         data_config["train_pairs"], data_config["root"], train_transform, methods
@@ -207,35 +231,22 @@ def main() -> None:
         drop_last=True,
         persistent_workers=num_workers > 0,
     )
-    clean_transform = FaceTransform(int(data_config.get("image_size", 224)))
+    clean_transform = FaceTransform(
+        int(data_config.get("image_size", 224)), artifact_mode=artifact_mode
+    )
     selection_manifest = data_config.get("validation_frames")
-    if selection_manifest:
-        selection_name = "validation"
-    else:
-        selection_manifest = data_config["celebdf_test_frames"]
-        selection_name = "celebdf_test"
-        print(
-            "warning: data.validation_frames is not configured; selecting the best "
-            "checkpoint on Celeb-DF test AUC leaks target-domain information"
+    if not selection_manifest:
+        raise ValueError(
+            "data.validation_frames is required for source-domain checkpoint "
+            "selection; Celeb-DF fallback is forbidden"
         )
+    selection_name = "validation"
     selection_loader = make_frame_loader(
         selection_manifest,
         data_config,
         clean_transform,
         int(train_config.get("eval_image_batch_size", 32)),
         device,
-    )
-    target_manifest = data_config.get("celebdf_test_frames")
-    target_loader = (
-        make_frame_loader(
-            target_manifest,
-            data_config,
-            clean_transform,
-            int(train_config.get("eval_image_batch_size", 32)),
-            device,
-        )
-        if target_manifest and str(target_manifest) != str(selection_manifest)
-        else None
     )
 
     resume_value = args.resume or train_config.get("resume")
@@ -270,11 +281,7 @@ def main() -> None:
     epochs_without_improvement = 0
     if resume_path is not None:
         checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
-        if int(checkpoint.get("format_version", 1)) < 2:
-            raise ValueError(
-                "this checkpoint predates the domain-invariant model/optimizer; "
-                "start a new run and pass it with --init-favit instead of --resume"
-            )
+        validate_checkpoint_artifacts(checkpoint, model_config, resume_path)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -338,8 +345,12 @@ def main() -> None:
             label_smoothing=float(loss_config.get("label_smoothing", 0.0)),
             max_grad_norm=float(train_config.get("max_grad_norm", 0.0)) or None,
         )
-        selection_metrics = evaluate_video_level(
-            model, selection_loader, device, description=f"evaluate {selection_name}"
+        selection_metrics = evaluate_at_level(
+            model,
+            selection_loader,
+            device,
+            level="frame",
+            description=f"evaluate {selection_name}",
         )
         record = {
             "epoch": epoch + 1,
@@ -354,7 +365,7 @@ def main() -> None:
         with history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
 
-        current_auc = float(selection_metrics["video_auc"])
+        current_auc = float(selection_metrics["auc"])
         scheduler.step()
         improved = current_auc > best_auc
         best_auc = max(best_auc, current_auc)
@@ -362,8 +373,10 @@ def main() -> None:
             0 if improved else epochs_without_improvement + 1
         )
         state = {
-            "format_version": 2,
-            "architecture": "favit_lsda",
+            "format_version": 3,
+            "architecture": "favit_lsda_cnn",
+            "artifact_mode": artifact_mode,
+            "cnn_in_channels": cnn_in_channels,
             "epoch": epoch,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -373,7 +386,6 @@ def main() -> None:
             "best_selection_auc": best_auc,
             "selection_name": selection_name,
             "selection_metrics": selection_metrics,
-            "celebdf_test_metrics": None,
             "epochs_without_improvement": epochs_without_improvement,
             "random_state": capture_random_state(),
             "config": config,
@@ -393,23 +405,48 @@ def main() -> None:
             )
             break
 
-    # Evaluate an external target only once, after source-validation model
-    # selection is complete. This prevents target AUC from steering epochs.
-    if target_loader is not None:
+    # Evaluate source test and target only once, after source-validation model
+    # selection is complete. This prevents either from steering epochs; target
+    # results in particular must never affect checkpoint selection.
+    ffpp_test_manifest = data_config.get("ffpp_test_frames")
+    celebdf_test_manifest = data_config.get("celebdf_test_frames")
+    if ffpp_test_manifest or celebdf_test_manifest:
         best_path = output_dir / "best.pt"
         if not best_path.is_file():
-            raise FileNotFoundError("no best checkpoint is available for target evaluation")
+            raise FileNotFoundError("no best checkpoint is available for final evaluation")
         best_state = torch.load(best_path, map_location=device, weights_only=False)
         model.load_state_dict(best_state["model"])
-        target_metrics = evaluate_video_level(
-            model, target_loader, device, description="final test CelebDF"
-        )
-        best_state["celebdf_test_metrics"] = target_metrics
-        save_checkpoint(best_path, best_state)
-        final_record = {"event": "final_target_evaluation", "celebdf_test": target_metrics}
+        final_record: dict = {"event": "final_evaluation"}
+        if ffpp_test_manifest:
+            ffpp_loader = make_frame_loader(
+                ffpp_test_manifest,
+                data_config,
+                clean_transform,
+                int(train_config.get("eval_image_batch_size", 32)),
+                device,
+            )
+            ffpp_test_metrics = evaluate_at_level(
+                model, ffpp_loader, device, level="video", description="final test FF++"
+            )
+            best_state["ffpp_test_metrics"] = ffpp_test_metrics
+            final_record["ffpp_test_metrics"] = ffpp_test_metrics
+        if celebdf_test_manifest:
+            celebdf_loader = make_frame_loader(
+                celebdf_test_manifest,
+                data_config,
+                clean_transform,
+                int(train_config.get("eval_image_batch_size", 32)),
+                device,
+            )
+            celebdf_test_metrics = evaluate_at_level(
+                model, celebdf_loader, device, level="video", description="final test CelebDF"
+            )
+            best_state["celebdf_test_metrics"] = celebdf_test_metrics
+            final_record["celebdf_test_metrics"] = celebdf_test_metrics
         print(json.dumps(final_record, indent=2))
         with history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(final_record) + "\n")
+        save_checkpoint(best_path, best_state)
 
 
 if __name__ == "__main__":

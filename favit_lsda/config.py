@@ -31,8 +31,27 @@ def resolve_device(requested: str) -> torch.device:
     return torch.device(requested)
 
 
+def validate_model_config(model_config: dict[str, Any]) -> None:
+    from .data import artifact_channels
+
+    mode = str(model_config.get("artifact_mode", "rgb"))
+    expected = artifact_channels(mode)
+    actual = int(model_config.get("cnn_in_channels", expected))
+    if actual != expected:
+        raise ValueError(
+            f"artifact mode/channel mismatch: mode={mode!r} expects {expected}, got {actual}"
+        )
+
+
 def build_model_from_config(model_config: dict[str, Any], pretrained: bool | None = None):
+    from .data import artifact_channels
     from .model import create_favit_lsda
+
+    validate_model_config(model_config)
+    artifact_mode = str(model_config.get("artifact_mode", "rgb"))
+    cnn_in_channels = int(
+        model_config.get("cnn_in_channels", artifact_channels(artifact_mode))
+    )
 
     return create_favit_lsda(
         model_name=model_config["backbone"],
@@ -65,4 +84,6 @@ def build_model_from_config(model_config: dict[str, Any], pretrained: bool | Non
         domain_adversarial_strength=model_config.get(
             "domain_adversarial_strength", 1.0
         ),
+        artifact_mode=artifact_mode,
+        cnn_in_channels=cnn_in_channels,
     )
