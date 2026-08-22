@@ -5,8 +5,6 @@ output_dir: outputs/favit_lsda_cnn_rgb_wavelet
 data:
   root: "E:\\Deepfake_Data_Chien\\ffpp_celebdf_data\\processed"
   train_pairs: "E:\\Deepfake_Data_Chien\\ffpp_celebdf_data\\processed\\manifests\\ffpp_c23_train_pairs.csv"
-  validation_frames: "E:\\Deepfake_Data_Chien\\ffpp_celebdf_data\\processed\\manifests\\ffpp_c23_val_frames.csv"
-  ffpp_test_frames: "E:\\Deepfake_Data_Chien\\ffpp_celebdf_data\\processed\\manifests\\ffpp_c23_test_frames.csv"
   celebdf_test_frames: "E:\\Deepfake_Data_Chien\\ffpp_celebdf_data\\processed\\manifests\\celebdf_test_frames.csv"
   image_size: 224
   num_workers: 4
