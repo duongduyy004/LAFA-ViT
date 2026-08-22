@@ -339,15 +339,6 @@ python train.py `
   --device cuda:0
 ```
 
-Khởi tạo các layer tương thích từ checkpoint `fa_vit_remake`:
-
-```powershell
-python train.py `
-  --config configs/favit_lsda_ffpp_c23_celebdf.yaml `
-  --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt `
-  --device cuda:0
-```
-
 Resume `favit_lsda`:
 
 ```powershell
@@ -374,40 +365,38 @@ file, để so sánh riêng phần đóng góp của từng loại artifact:
 | `configs/favit_lsda_cnn_rgb_srm_fft.yaml` | `rgb_srm_fft` | `9` | `outputs/favit_lsda_cnn_rgb_srm_fft` |
 | `configs/favit_lsda_cnn_rgb_srm_wavelet.yaml` | `rgb_srm_wavelet` | `9` | `outputs/favit_lsda_cnn_rgb_srm_wavelet` |
 
-Train một thí nghiệm CNN artifact, khởi tạo từ checkpoint `fa_vit_remake`:
+Train một thí nghiệm CNN artifact:
 
 ```powershell
 python train.py `
   --config configs/favit_lsda_cnn_rgb_srm_fft.yaml `
-  --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt `
   --device cuda:0
 ```
 
 ### Chạy lần lượt từng case
 
-Mỗi lệnh dưới đây ứng với một trong sáu config ở bảng trên, dùng chung
-`--init-favit`. Sáu case độc lập với nhau — chạy theo thứ tự bất kỳ, chạy lại
-một case không ảnh hưởng các case còn lại vì mỗi case ghi log/checkpoint/
-`history.jsonl` vào `output_dir` riêng.
+Mỗi lệnh dưới đây ứng với một trong sáu config ở bảng trên. Sáu case độc lập
+với nhau — chạy theo thứ tự bất kỳ, chạy lại một case không ảnh hưởng các case
+còn lại vì mỗi case ghi log/checkpoint/`history.jsonl` vào `output_dir` riêng.
 
 ```powershell
 # 1) rgb
-python train.py --config configs/favit_lsda_cnn_rgb.yaml --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt
+python train.py --config configs/favit_lsda_cnn_rgb.yaml
 
 # 2) rgb_srm
-python train.py --config configs/favit_lsda_cnn_rgb_srm.yaml --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt
+python train.py --config configs/favit_lsda_cnn_rgb_srm.yaml
 
 # 3) rgb_fft
-python train.py --config configs/favit_lsda_cnn_rgb_fft.yaml --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt
+python train.py --config configs/favit_lsda_cnn_rgb_fft.yaml
 
 # 4) rgb_wavelet
-python train.py --config configs/favit_lsda_cnn_rgb_wavelet.yaml --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt
+python train.py --config configs/favit_lsda_cnn_rgb_wavelet.yaml
 
 # 5) rgb_srm_fft
-python train.py --config configs/favit_lsda_cnn_rgb_srm_fft.yaml --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt
+python train.py --config configs/favit_lsda_cnn_rgb_srm_fft.yaml
 
 # 6) rgb_srm_wavelet
-python train.py --config configs/favit_lsda_cnn_rgb_srm_wavelet.yaml --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt
+python train.py --config configs/favit_lsda_cnn_rgb_srm_wavelet.yaml
 ```
 
 Mỗi lệnh train xong, `outputs/favit_lsda_cnn_<mode>/best.pt` và
@@ -428,18 +417,11 @@ python evaluate_celebdf.py --config configs/favit_lsda_cnn_rgb_srm_fft.yaml --ch
 ứng cho năm case còn lại. Chi tiết `--level`/định dạng kết quả xem
 [Evaluate](#evaluate).
 
-`--init-favit` chỉ copy các tensor FA-ViT trùng tên **và** trùng shape từ
-checkpoint nguồn (`load_favit_initialization`); binary head luôn bị loại trừ,
-còn `ArtifactCNN`, `late_fusion` và head được khởi tạo mới hoàn toàn — checkpoint
-`fa_vit_remake` không có các nhánh này nên không kiểm tra `artifact_mode`/
-`cnn_in_channels` ở bước này.
-
-`--resume` thì ngược lại: nghiêm ngặt hơn có chủ đích
+`--resume` được kiểm tra nghiêm ngặt có chủ đích
 (`validate_checkpoint_artifacts`). Nó từ chối checkpoint có `architecture` khác
 `"favit_lsda_cnn"` (checkpoint cũ trước khi có nhánh CNN) và từ chối checkpoint
 có `artifact_mode`/`cnn_in_channels` khác với config hiện tại — một checkpoint
-train với `rgb_srm` không thể `--resume` dưới config `rgb_fft`. Với checkpoint
-không tương thích, dùng `--init-favit` để bắt đầu run mới thay vì `--resume`.
+train với `rgb_srm` không thể `--resume` dưới config `rgb_fft`.
 
 ## Evaluate
 
@@ -503,12 +485,9 @@ seed, split, số frame và checkpoint-selection protocol.
 2. Dùng duy nhất FF++ train để backprop và FF++ validation để chọn `best.pt`.
 3. Không điều chỉnh hyperparameter, epoch hay checkpoint theo Celeb-DF test AUC.
 4. Cố định checkpoint rồi mới test trên Celeb-DF-v2, DFDC hoặc WildDeepfake.
-5. Giữ cùng split, số frame và cùng thang đo (mặc định là **cấp ảnh**, khớp tín
-   hiệu chọn checkpoint — xem [Validation, checkpoint và cross-test](#validation-checkpoint-và-cross-test))
+5. Giữ cùng split, số frame và cùng thang đo (mặc định là **cấp video**, khớp
+   tín hiệu chọn checkpoint — xem [Validation, checkpoint và cross-test](#validation-checkpoint-và-cross-test))
    giữa các phương pháp; chạy ít nhất ba seed và báo cáo mean/std AUC.
-
-Checkpoint format cũ không thể `--resume` với kiến trúc mới; có thể dùng checkpoint
-đó qua `--init-favit` để nạp các tensor tương thích rồi train một run mới.
 
 Ablation đề xuất, mỗi cấu hình chạy ít nhất ba seed:
 
