@@ -23,17 +23,19 @@ video FF++ / Celeb-DF-v2
           │                                      └─> best.pt / last.pt
           │
           ├─ FF++ validation_frames.csv ─────────> chọn best.pt, early stopping
-          │                                        (AUC cấp ảnh, bắt buộc)
+          │  (nếu thiếu, fallback sang celebdf_test_frames.csv, kèm warning leak)
+          │  (AUC cấp video: trung bình xác suất frame theo video_id)
           │
-          └─ sau khi best.pt cố định, train.py tự chạy post-selection test:
-             ├─ FF++ ffpp_test_frames.csv ────────> test nguồn cùng miền
-             └─ Celeb-DF celebdf_test_frames.csv ─> cross-dataset test
-                (cả hai đều cấp ảnh, một lần duy nhất, không ảnh hưởng selection)
+          └─ sau khi best.pt cố định, nếu celebdf_test_frames khác manifest chọn
+             checkpoint ở trên, train.py chạy lại một lần duy nhất trên đó
+             (cấp video, không ảnh hưởng selection)
 ```
 
-Protocol đúng là train và chọn checkpoint hoàn toàn trên FF++, sau đó mới dùng
-checkpoint đã cố định để test trên Celeb-DF-v2. Celeb-DF không được dùng để tính
-gradient.
+Protocol mặc định (khi không cấu hình `validation_frames`) là train trên FF++ và
+chọn checkpoint theo AUC cấp video trên Celeb-DF test — tức Celeb-DF được dùng
+làm validation, chỉ không tham gia tính gradient. Nếu cần chọn checkpoint hoàn
+toàn trong-miền (không leak), cấu hình `data.validation_frames` với một manifest
+FF++ tách riêng.
 
 ## Xử lý dữ liệu
 
@@ -42,9 +44,9 @@ gradient.
 | Trường cấu hình | Cột bắt buộc | Vai trò |
 | --- | --- | --- |
 | `data.train_pairs` | `fake_path,real_path,method` | Tạo các group FF++ dùng cho backprop; `video_id,sample_index` có thể được giữ để truy vết |
-| `data.validation_frames` | `path,label,video_id` | **Bắt buộc.** `train.py` báo lỗi và dừng ngay nếu thiếu trường này. Đây là tín hiệu chọn checkpoint duy nhất: mỗi epoch, `best.pt` được cập nhật theo AUC **cấp frame/image** trên chính manifest FF++ nguồn này (`evaluate_at_level(..., level="frame")`), không dùng Celeb-DF làm fallback |
-| `data.ffpp_test_frames` | `path,label,video_id` | Test FF++ độc lập, chỉ chạy **một lần sau khi** model selection đã kết thúc (post-selection). Không ảnh hưởng tới việc chọn `best.pt`. Dùng cho `evaluate_ffpp.py` (không bắt buộc nếu truyền `--manifest`) |
-| `data.celebdf_test_frames` | `path,label,video_id` | Cross-dataset evaluation trên Celeb-DF-v2, cũng chỉ chạy **một lần sau khi** model selection kết thúc (post-selection). Không bao giờ được dùng để chọn checkpoint |
+| `data.validation_frames` | `path,label,video_id` | **Khuyến nghị, không bắt buộc.** Nếu đặt, đây là tín hiệu chọn checkpoint: mỗi epoch, `best.pt` được cập nhật theo AUC **cấp video** trên manifest FF++ này. Nếu thiếu, `train.py` in warning và fallback sang dùng `data.celebdf_test_frames` làm tín hiệu chọn checkpoint (leak target-domain có chủ đích, theo protocol "validation trên Celeb-DF") |
+| `data.ffpp_test_frames` | `path,label,video_id` | Không được `train.py` tự động dùng. Chỉ dùng làm manifest mặc định cho `evaluate_ffpp.py` khi không truyền `--manifest` |
+| `data.celebdf_test_frames` | `path,label,video_id` | Nếu `validation_frames` không đặt, dùng làm tín hiệu chọn checkpoint (xem trên). Nếu khác manifest đang dùng để chọn checkpoint, còn được `train.py` đánh giá **một lần** sau khi `best.pt` cố định (post-selection, cấp video), không ảnh hưởng tới việc chọn checkpoint |
 
 Đường dẫn ảnh trong manifest có thể là đường dẫn tuyệt đối hoặc tương đối với
 `data.root`. Nhãn nhị phân dùng `0 = real`, `1 = fake`.
@@ -91,14 +93,14 @@ nhận RGB đã augment, không phải ảnh gốc). Vì vậy artifact SRM/FFT/
 phản ánh đúng ảnh mà nhánh CNN quan sát, kể cả khi bị nén JPEG hay hạ độ phân
 giải. Xem chi tiết widths và nhánh CNN ở [Artifact CNN và late fusion](#artifact-cnn-và-late-fusion).
 
-> **Bắt buộc `data.validation_frames`:** `train.py` yêu cầu trường này và báo lỗi
-> ngay khi thiếu (`ValueError`) — không còn fallback sang `celebdf_test_frames` để
-> chọn checkpoint. Đây là thay đổi có chủ đích để loại bỏ leakage: model selection
-> chỉ được phép dựa trên AUC **cấp frame/image** đo trên manifest FF++ nguồn này.
-> Hãy dùng một manifest validation FF++ được tách theo **video nguồn**.
-> `data.ffpp_test_frames` và `data.celebdf_test_frames` chỉ được đánh giá **một
-> lần, sau khi** `best.pt` đã cố định — không bao giờ ảnh hưởng đến việc chọn
-> checkpoint.
+> **`data.validation_frames` là tuỳ chọn:** nếu đặt, model selection dựa trên AUC
+> **cấp video** đo trên manifest FF++ này, không leak Celeb-DF. Nếu không đặt,
+> `train.py` fallback sang chọn checkpoint bằng AUC cấp video trên
+> `data.celebdf_test_frames` (kèm warning) — đây là protocol "train FF++,
+> validation Celeb-DF" mặc định của repo. `data.celebdf_test_frames` chỉ được
+> đánh giá lại **một lần, sau khi** `best.pt` đã cố định nếu nó khác manifest
+> đang dùng để chọn checkpoint — không bao giờ ảnh hưởng đến việc chọn
+> checkpoint đó.
 
 ## Kiến trúc mô hình
 
@@ -309,24 +311,24 @@ khi nhận đầy đủ các ràng buộc auxiliary.
 
 ### Validation, checkpoint và cross-test
 
-`data.validation_frames` là **bắt buộc**; `train.py` raise `ValueError` ngay khi
-config thiếu trường này, không còn fallback sang Celeb-DF. Sau mỗi epoch, model
-được đánh giá trên chính manifest này ở **cấp frame/image**
-(`evaluate_at_level(..., level="frame")`) — không aggregate theo `video_id`.
-`best.pt` được cập nhật khi AUC frame-level trên `validation_frames` tăng,
-`last.pt` luôn lưu trạng thái mới nhất và early stopping dựa trên cùng AUC này.
-Đây là tín hiệu chọn checkpoint duy nhất; Celeb-DF không bao giờ tham gia.
+`data.validation_frames` là **tuỳ chọn**. Nếu đặt, mỗi epoch model được đánh
+giá trên chính manifest này; nếu không, `train.py` in warning và dùng
+`data.celebdf_test_frames` thay thế (đây là protocol mặc định của repo: train
+FF++, validation Celeb-DF). Cả hai trường hợp đều dùng `evaluate_at_level(...)`
+ở **cấp video** (mặc định của hàm) — xác suất các frame cùng `video_id` được
+lấy trung bình trước khi tính AUC. `best.pt` được cập nhật khi AUC video-level
+trên manifest chọn tăng, `last.pt` luôn lưu trạng thái mới nhất và early
+stopping dựa trên cùng AUC này.
 
 Sau khi vòng lặp train/early-stopping kết thúc (tức `best.pt` đã cố định), nếu
-config có khai báo `data.ffpp_test_frames` và/hoặc `data.celebdf_test_frames`,
-`train.py` nạp lại `best.pt` và đánh giá **một lần duy nhất** trên các manifest
-này, ghi kết quả vào checkpoint (`ffpp_test_metrics`/`celebdf_test_metrics`) và
-`history.jsonl`. Cả hai đều là test post-selection thuần tuý — không backprop,
-không ảnh hưởng tới việc chọn checkpoint hay early stopping. Cả hai cũng chạy ở
-**cấp ảnh** (`evaluate_at_level(..., level="frame")`), giống hệt tín hiệu chọn
-checkpoint, để sáu experiment được so sánh trên cùng một thang đo image-level.
-Nếu cần số liệu cấp video, chạy `evaluate_ffpp.py` / `evaluate_celebdf.py` với
-`--level video` trên `best.pt`.
+`data.celebdf_test_frames` khác manifest vừa dùng để chọn checkpoint, `train.py`
+nạp lại `best.pt` và đánh giá lại **một lần duy nhất** trên đó (cấp video), ghi
+kết quả vào checkpoint (`celebdf_test_metrics`) và `history.jsonl`
+(`event: final_target_evaluation`). Đây là test post-selection thuần tuý —
+không backprop, không ảnh hưởng tới việc chọn checkpoint hay early stopping.
+`data.ffpp_test_frames` không được `train.py` dùng ở bước này; chạy
+`evaluate_ffpp.py` / `evaluate_celebdf.py` (tuỳ chọn `--level frame`/`video`)
+trên `best.pt` để lấy số liệu FF++ test hoặc số liệu ở thang đo khác.
 
 ## Cài đặt và train
 
@@ -408,13 +410,14 @@ python train.py --config configs/favit_lsda_cnn_rgb_srm_fft.yaml --init-favit ..
 python train.py --config configs/favit_lsda_cnn_rgb_srm_wavelet.yaml --init-favit ..\fa_vit_remake\outputs\favit_ffpp_c23\best.pt
 ```
 
-Mỗi lệnh train xong là đủ số liệu so sánh: `outputs/favit_lsda_cnn_<mode>/best.pt`
-và `history.jsonl` đã có sẵn `validation`, `ffpp_test_metrics`,
-`celebdf_test_metrics` — cả ba đều ở cấp frame (xem
+Mỗi lệnh train xong, `outputs/favit_lsda_cnn_<mode>/best.pt` và
+`history.jsonl` đã có sẵn `validation` (AUC cấp video trên `validation_frames`)
+và `celebdf_test_metrics` (cấp video, post-selection — xem
 [Validation, checkpoint và cross-test](#validation-checkpoint-và-cross-test)).
-Không cần chạy thêm `evaluate_ffpp.py`/`evaluate_celebdf.py`, trừ khi muốn số
-liệu cấp video hoặc đánh giá lại trên manifest khác — ví dụ với case
-`rgb_srm_fft`:
+`train.py` không tự đánh giá `data.ffpp_test_frames`; chạy `evaluate_ffpp.py`
+để lấy số liệu FF++ test, và `evaluate_ffpp.py`/`evaluate_celebdf.py` với
+`--level frame` nếu muốn so sánh sáu case ở cấp ảnh thay vì cấp video — ví dụ
+với case `rgb_srm_fft`:
 
 ```powershell
 python evaluate_ffpp.py --config configs/favit_lsda_cnn_rgb_srm_fft.yaml --checkpoint outputs\favit_lsda_cnn_rgb_srm_fft\best.pt --level video

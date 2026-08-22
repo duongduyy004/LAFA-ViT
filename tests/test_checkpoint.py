@@ -277,21 +277,21 @@ def test_train_resume_rejects_mismatched_checkpoint_before_loading_state(
         assert torch.equal(value, snapshot[key])
 
 
-def test_post_selection_tests_run_at_image_level_and_persist_model_metadata(
+def test_final_target_evaluation_runs_at_video_level_and_persists_model_metadata(
     tmp_path, monkeypatch
 ):
     """Pins the post-selection protocol and the source of checkpoint metadata.
 
-    The experiment design compares all six cases on image-level source-test and
-    target metrics, so the two post-selection evaluations must aggregate at
-    frame level exactly like checkpoint selection does -- not per video.
+    Checkpoint selection and the final Celeb-DF target evaluation both
+    aggregate at video level, matching fa_vit_lsda's baseline training flow
+    -- not per frame.
 
     The same run also proves the persisted artifact metadata comes from the
     constructed model instance rather than from a second, independently
     resolved copy of the config.
     """
     config_path, config = _write_train_fixture(
-        tmp_path, epochs=1, ffpp_test_frames=True, celebdf_test_frames=True
+        tmp_path, epochs=1, celebdf_test_frames=True
     )
     captured = _record_train_models(monkeypatch)
     monkeypatch.setattr("sys.argv", ["train.py", "--config", config_path])
@@ -302,11 +302,12 @@ def test_post_selection_tests_run_at_image_level_and_persist_model_metadata(
         json.loads(line)
         for line in (output_dir / "history.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    final = [record for record in records if record.get("event") == "final_evaluation"]
+    final = [
+        record for record in records if record.get("event") == "final_target_evaluation"
+    ]
     assert len(final) == 1
-    for key in ("ffpp_test_metrics", "celebdf_test_metrics"):
-        assert final[0][key]["level"] == "frame"
-        assert "num_videos" not in final[0][key]
+    assert final[0]["celebdf_test"]["level"] == "video"
+    assert final[0]["celebdf_test"]["num_videos"] == 2
 
     assert len(captured) == 1
     model, _ = captured[0]
@@ -315,5 +316,4 @@ def test_post_selection_tests_run_at_image_level_and_persist_model_metadata(
     assert best["architecture"] == "favit_lsda_cnn"
     assert best["artifact_mode"] == model.artifact_mode
     assert best["cnn_in_channels"] == model.cnn_in_channels
-    assert best["ffpp_test_metrics"]["level"] == "frame"
-    assert best["celebdf_test_metrics"]["level"] == "frame"
+    assert best["celebdf_test_metrics"]["level"] == "video"

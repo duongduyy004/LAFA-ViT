@@ -251,18 +251,33 @@ def main() -> None:
         int(data_config.get("image_size", 224)), artifact_mode=artifact_mode
     )
     selection_manifest = data_config.get("validation_frames")
-    if not selection_manifest:
-        raise ValueError(
-            "data.validation_frames is required for source-domain checkpoint "
-            "selection; Celeb-DF fallback is forbidden"
+    if selection_manifest:
+        selection_name = "validation"
+    else:
+        selection_manifest = data_config["celebdf_test_frames"]
+        selection_name = "celebdf_test"
+        print(
+            "warning: data.validation_frames is not configured; selecting the best "
+            "checkpoint on Celeb-DF test AUC leaks target-domain information"
         )
-    selection_name = "validation"
     selection_loader = make_frame_loader(
         selection_manifest,
         data_config,
         clean_transform,
         int(train_config.get("eval_image_batch_size", 32)),
         device,
+    )
+    target_manifest = data_config.get("celebdf_test_frames")
+    target_loader = (
+        make_frame_loader(
+            target_manifest,
+            data_config,
+            clean_transform,
+            int(train_config.get("eval_image_batch_size", 32)),
+            device,
+        )
+        if target_manifest and str(target_manifest) != str(selection_manifest)
+        else None
     )
 
     resume_value = args.resume or train_config.get("resume")
@@ -365,7 +380,6 @@ def main() -> None:
             model,
             selection_loader,
             device,
-            level="frame",
             description=f"evaluate {selection_name}",
         )
         record = {
@@ -405,6 +419,7 @@ def main() -> None:
             "best_selection_auc": best_auc,
             "selection_name": selection_name,
             "selection_metrics": selection_metrics,
+            "celebdf_test_metrics": None,
             "epochs_without_improvement": epochs_without_improvement,
             "random_state": capture_random_state(),
             "config": config,
@@ -424,54 +439,23 @@ def main() -> None:
             )
             break
 
-    # Evaluate source test and target only once, after source-validation model
-    # selection is complete. This prevents either from steering epochs; target
-    # results in particular must never affect checkpoint selection. Both run at
-    # image (frame) level, matching selection, as the experiment design requires
-    # every case be compared on image-level source-test and target metrics.
-    def _is_selection_manifest(manifest: str | None) -> bool:
-        return bool(manifest) and Path(manifest).resolve() == Path(selection_manifest).resolve()
-
-    final_test_datasets = (
-        ("ffpp_test_frames", "ffpp_test_metrics", "final test FF++"),
-        ("celebdf_test_frames", "celebdf_test_metrics", "final test CelebDF"),
-    )
-    final_manifests = {}
-    for manifest_key, metrics_key, description in final_test_datasets:
-        manifest = data_config.get(manifest_key)
-        if _is_selection_manifest(manifest):
-            print(
-                f"final_evaluation: skipping data.{manifest_key}, it is the same "
-                "file as data.validation_frames"
-            )
-            continue
-        if manifest:
-            final_manifests[metrics_key] = (manifest, description)
-
-    if final_manifests:
+    # Evaluate an external target only once, after source-validation model
+    # selection is complete. This prevents target AUC from steering epochs.
+    if target_loader is not None:
         best_path = output_dir / "best.pt"
         if not best_path.is_file():
-            raise FileNotFoundError("no best checkpoint is available for final evaluation")
+            raise FileNotFoundError("no best checkpoint is available for target evaluation")
         best_state = torch.load(best_path, map_location=device, weights_only=False)
         model.load_state_dict(best_state["model"])
-        final_record: dict = {"event": "final_evaluation"}
-        for metrics_key, (manifest, description) in final_manifests.items():
-            loader = make_frame_loader(
-                manifest,
-                data_config,
-                clean_transform,
-                int(train_config.get("eval_image_batch_size", 32)),
-                device,
-            )
-            metrics = evaluate_at_level(
-                model, loader, device, level="frame", description=description
-            )
-            best_state[metrics_key] = metrics
-            final_record[metrics_key] = metrics
+        target_metrics = evaluate_at_level(
+            model, target_loader, device, description="final test CelebDF"
+        )
+        best_state["celebdf_test_metrics"] = target_metrics
+        save_checkpoint(best_path, best_state)
+        final_record = {"event": "final_target_evaluation", "celebdf_test": target_metrics}
         print(json.dumps(final_record, indent=2))
         with history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(final_record) + "\n")
-        save_checkpoint(best_path, best_state)
 
 
 if __name__ == "__main__":
